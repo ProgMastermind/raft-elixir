@@ -358,7 +358,7 @@ Demo.info("Heartbeat prevents followers from timing out during normal operation"
 # ===========================================================================
 Demo.banner("FINAL STATE — All nodes converged")
 
-active_leader = Demo.find_leader(cluster)
+_active_leader = Demo.find_leader(cluster)
 Process.sleep(300)
 Demo.show_cluster(cluster)
 

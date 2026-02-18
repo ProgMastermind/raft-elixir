@@ -208,14 +208,6 @@ defmodule RaftEx.Server do
     {:stop, :normal}
   end
 
-  def candidate(:info, :shutdown_not_in_cluster, _data) do
-    {:stop, :normal}
-  end
-
-  def leader(:info, :shutdown_not_in_cluster, _data) do
-    {:stop, :normal}
-  end
-
   # ---------------------------------------------------------------------------
   # CANDIDATE state (§5.2)
   # ---------------------------------------------------------------------------
@@ -259,6 +251,11 @@ defmodule RaftEx.Server do
 
   def candidate({:call, from}, :status, data) do
     {:keep_state, data, [{:reply, from, build_status(data, :candidate)}]}
+  end
+
+  # §6: node removed from cluster — shut down gracefully
+  def candidate(:info, :shutdown_not_in_cluster, _data) do
+    {:stop, :normal}
   end
 
   # ---------------------------------------------------------------------------
@@ -305,6 +302,11 @@ defmodule RaftEx.Server do
 
   def leader({:call, from}, :status, data) do
     {:keep_state, data, [{:reply, from, build_status(data, :leader)}]}
+  end
+
+  # §6: node removed from cluster — shut down gracefully
+  def leader(:info, :shutdown_not_in_cluster, _data) do
+    {:stop, :normal}
   end
 
   # Catch-all for leader
