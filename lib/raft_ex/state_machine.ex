@@ -62,6 +62,11 @@ defmodule RaftEx.StateMachine do
     {state, :ok}
   end
 
+  def apply_command(state, {:config_change, _new_cluster}) do
+    # §6: cluster membership change — handled at server level, not KV level
+    {state, :ok}
+  end
+
   @doc """
   Apply a list of log entries to the state machine in order. (§5.3)
 

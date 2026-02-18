@@ -119,6 +119,46 @@ defmodule RaftEx do
   end
 
   @doc """
+  Add a node to the cluster using joint consensus (§6).
+
+  Submits a `{:config_change, new_cluster}` entry to the leader.
+  The cluster transitions through C_old,new → C_new safely.
+  The new node must already be started with `start_node/2`.
+  """
+  @spec add_node(atom(), atom(), [atom()]) :: {:ok, term()} | {:error, term()}
+  def add_node(_any_node, new_node, current_cluster) do
+    new_cluster = Enum.uniq(current_cluster ++ [new_node])
+    leader = find_leader(current_cluster)
+    if leader == nil do
+      {:error, :no_leader}
+    else
+      case Server.command(leader, {:config_change, new_cluster}) do
+        {:ok, _} -> {:ok, new_cluster}
+        other -> other
+      end
+    end
+  end
+
+  @doc """
+  Remove a node from the cluster using joint consensus (§6).
+
+  Submits a `{:config_change, new_cluster}` entry to the leader.
+  """
+  @spec remove_node(atom(), atom(), [atom()]) :: {:ok, term()} | {:error, term()}
+  def remove_node(_any_node, node_to_remove, current_cluster) do
+    new_cluster = Enum.reject(current_cluster, &(&1 == node_to_remove))
+    leader = find_leader(current_cluster)
+    if leader == nil do
+      {:error, :no_leader}
+    else
+      case Server.command(leader, {:config_change, new_cluster}) do
+        {:ok, _} -> {:ok, new_cluster}
+        other -> other
+      end
+    end
+  end
+
+  @doc """
   Submit a command to the cluster, auto-routing to the leader. (§8)
 
   Tries each node until it finds the leader. Retries up to `retries` times

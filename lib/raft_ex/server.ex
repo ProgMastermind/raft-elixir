@@ -56,7 +56,10 @@ defmodule RaftEx.Server do
     :next_index,    # %{peer => index} — §5.3
     :match_index,   # %{peer => index} — §5.3
     # Pending client calls waiting for commit
-    :pending        # %{log_index => {from, command}}
+    :pending,       # %{log_index => {from, command}}
+    # §6 Joint consensus — nil when not in transition
+    # {old_cluster, new_cluster} during C_old,new phase
+    :joint_config   # {[atom()], [atom()]} | nil
   ]
 
   # ---------------------------------------------------------------------------
@@ -572,6 +575,15 @@ defmodule RaftEx.Server do
   # ---------------------------------------------------------------------------
 
   defp handle_client_command(from, cmd, data) do
+    # §6: handle membership change commands specially
+    data = case cmd do
+      {:config_change, new_cluster} ->
+        # §6: Phase 1 — enter joint consensus C_old,new
+        %{data | joint_config: {data.cluster, new_cluster}}
+      _ ->
+        data
+    end
+
     # §5.3: leader appends entry to its log
     {:ok, index} = Log.append(data.node_id, data.current_term, cmd)
 
@@ -762,6 +774,16 @@ defmodule RaftEx.Server do
       data = Enum.reduce(results, data, fn {index, result}, acc ->
         :telemetry.execute([:raft_ex, :log, :applied], %{count: 1},
           %{node_id: acc.node_id, index: index, result: result})
+
+        # §6: if this was a config_change entry, complete the transition to C_new
+        acc = case Log.get(acc.node_id, index) do
+          {_, _, {:config_change, new_cluster}} ->
+            :telemetry.execute([:raft_ex, :cluster, :config_change], %{count: 1},
+              %{node_id: acc.node_id, new_cluster: new_cluster})
+            %{acc | cluster: new_cluster, joint_config: nil}
+          _ ->
+            acc
+        end
 
         # Reply to pending client call if any
         case Map.pop(acc.pending, index) do
