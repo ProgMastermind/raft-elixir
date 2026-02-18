@@ -64,6 +64,20 @@ defmodule RaftEx.Server do
   # ---------------------------------------------------------------------------
 
   @doc """
+  child_spec/1 for DynamicSupervisor compatibility.
+  Accepts `{node_id, cluster}` as the argument.
+  """
+  def child_spec({node_id, cluster}) do
+    %{
+      id: {__MODULE__, node_id},
+      start: {__MODULE__, :start_link, [node_id, cluster]},
+      type: :worker,
+      restart: :transient,
+      shutdown: 5_000
+    }
+  end
+
+  @doc """
   Start a Raft server node and register it under `raft_server_{node_id}`.
   """
   @spec start_link(atom(), [atom()]) :: :gen_statem.start_ret()
