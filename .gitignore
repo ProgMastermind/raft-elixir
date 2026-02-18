@@ -1,0 +1,28 @@
+# Build artifacts
+/_build/
+/cover/
+/deps/
+/doc/
+
+# Mix lock (keep for reproducibility — do NOT ignore)
+# mix.lock
+
+# Test coverage
+/cover/
+
+# DETS persistence files (runtime data, not source)
+*.dets
+
+# Snapshot files (runtime data)
+*.bin
+
+# Elixir/Erlang crash dumps
+erl_crash.dump
+*.crashdump
+
+# Editor files
+.DS_Store
+.elixir_ls/
+.idea/
+*.swp
+*.swo
