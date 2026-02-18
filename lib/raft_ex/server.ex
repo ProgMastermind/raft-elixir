@@ -208,6 +208,14 @@ defmodule RaftEx.Server do
     {:stop, :normal}
   end
 
+  def candidate(:info, :shutdown_not_in_cluster, _data) do
+    {:stop, :normal}
+  end
+
+  def leader(:info, :shutdown_not_in_cluster, _data) do
+    {:stop, :normal}
+  end
+
   # ---------------------------------------------------------------------------
   # CANDIDATE state (§5.2)
   # ---------------------------------------------------------------------------
