@@ -1,66 +1,61 @@
 defmodule RaftEx.Inspector do
   @moduledoc """
-  Telemetry-based event observer for RaftEx.
+  Telemetry-based observability for RaftEx. (§5.1–§5.6, §7, §8)
 
-  Subscribes to all Raft telemetry events and prints human-readable,
-  color-coded output to stdout so the full data flow is visible during
-  development and demos.
+  Attaches handlers to all `:raft_ex` telemetry events and prints
+  colored, structured output to stdout so every state transition, RPC,
+  commit, and snapshot is visible during the demo.
 
-  Log format: `[NODE :id] [ROLE] event description`
+  ## Events handled
 
-  This module is a GenServer that attaches telemetry handlers on start.
-  It is started by `RaftEx.Application` before any Raft nodes, ensuring
-  every state transition and RPC is captured from the very beginning.
-
-  ## Telemetry Events Handled
-
-  - `[:raft_ex, :state_transition]`  — role change (follower/candidate/leader)
-  - `[:raft_ex, :rpc, :sent]`        — RPC sent to a peer
-  - `[:raft_ex, :rpc, :reply_sent]`  — RPC reply sent back to sender
-  - `[:raft_ex, :rpc, :received]`    — RPC received from a peer
-  - `[:raft_ex, :election, :timeout]`— election timeout fired
-  - `[:raft_ex, :election, :won]`    — candidate won election
-  - `[:raft_ex, :election, :lost]`   — candidate lost (stepped down)
-  - `[:raft_ex, :log, :appended]`    — entry appended to local log
-  - `[:raft_ex, :log, :committed]`   — commitIndex advanced
-  - `[:raft_ex, :log, :applied]`     — entry applied to state machine
-  - `[:raft_ex, :snapshot, :created]`   — snapshot taken
-  - `[:raft_ex, :snapshot, :installed]` — snapshot installed from leader
-  - `[:raft_ex, :client, :command]`  — client command received
-  - `[:raft_ex, :client, :response]` — client command response sent
+  | Event | Description |
+  |-------|-------------|
+  | `[:raft_ex, :state, :transition]` | Role change (follower/candidate/leader) |
+  | `[:raft_ex, :election, :start]`   | Candidate starts election |
+  | `[:raft_ex, :election, :won]`     | Candidate wins election |
+  | `[:raft_ex, :election, :lost]`    | Candidate loses (higher term seen) |
+  | `[:raft_ex, :vote, :granted]`     | Follower grants vote |
+  | `[:raft_ex, :vote, :denied]`      | Follower denies vote |
+  | `[:raft_ex, :rpc, :sent]`         | RPC sent to peer |
+  | `[:raft_ex, :rpc, :reply_sent]`   | RPC reply sent to peer |
+  | `[:raft_ex, :log, :appended]`     | Leader appended entry to log |
+  | `[:raft_ex, :log, :committed]`    | Entry committed (majority replicated) |
+  | `[:raft_ex, :log, :applied]`      | Entry applied to state machine |
+  | `[:raft_ex, :snapshot, :created]` | Snapshot created (log compaction) |
+  | `[:raft_ex, :snapshot, :installed]`| Snapshot installed on follower |
+  | `[:raft_ex, :heartbeat, :sent]`   | Leader sent heartbeat |
   """
 
   use GenServer
   require Logger
 
-  # All telemetry events this inspector handles
-  @telemetry_events [
-    [:raft_ex, :state_transition],
-    [:raft_ex, :rpc, :sent],
-    [:raft_ex, :rpc, :reply_sent],
-    [:raft_ex, :rpc, :received],
-    [:raft_ex, :election, :timeout],
+  # ANSI color codes for role-based coloring
+  @reset "\e[0m"
+  @bold "\e[1m"
+  @cyan "\e[36m"
+  @yellow "\e[33m"
+  @green "\e[32m"
+  @red "\e[31m"
+  @magenta "\e[35m"
+  @blue "\e[34m"
+  @white "\e[37m"
+
+  @events [
+    [:raft_ex, :state, :transition],
+    [:raft_ex, :election, :start],
     [:raft_ex, :election, :won],
     [:raft_ex, :election, :lost],
+    [:raft_ex, :vote, :granted],
+    [:raft_ex, :vote, :denied],
+    [:raft_ex, :rpc, :sent],
+    [:raft_ex, :rpc, :reply_sent],
     [:raft_ex, :log, :appended],
     [:raft_ex, :log, :committed],
     [:raft_ex, :log, :applied],
     [:raft_ex, :snapshot, :created],
     [:raft_ex, :snapshot, :installed],
-    [:raft_ex, :client, :command],
-    [:raft_ex, :client, :response]
+    [:raft_ex, :heartbeat, :sent]
   ]
-
-  # ANSI color codes
-  @reset "\e[0m"
-  @bold "\e[1m"
-  @cyan "\e[36m"
-  @green "\e[32m"
-  @yellow "\e[33m"
-  @red "\e[31m"
-  @magenta "\e[35m"
-  @blue "\e[34m"
-  @white "\e[37m"
 
   # ---------------------------------------------------------------------------
   # GenServer lifecycle
@@ -70,30 +65,21 @@ defmodule RaftEx.Inspector do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  @impl true
+  @impl GenServer
   def init(_opts) do
-    # Attach all telemetry handlers
-    for event <- @telemetry_events do
-      handler_id = {__MODULE__, event}
-
-      :telemetry.attach(
-        handler_id,
-        event,
-        &__MODULE__.handle_event/4,
-        nil
-      )
-    end
+    :telemetry.attach_many(
+      "raft_ex_inspector",
+      @events,
+      &__MODULE__.handle_event/4,
+      nil
+    )
 
     {:ok, %{}}
   end
 
-  @impl true
+  @impl GenServer
   def terminate(_reason, _state) do
-    # Detach all handlers on shutdown
-    for event <- @telemetry_events do
-      :telemetry.detach({__MODULE__, event})
-    end
-
+    :telemetry.detach("raft_ex_inspector")
     :ok
   end
 
@@ -102,150 +88,124 @@ defmodule RaftEx.Inspector do
   # ---------------------------------------------------------------------------
 
   @doc false
-  def handle_event([:raft_ex, :state_transition], _measurements, meta, _config) do
-    %{node_id: node_id, from: from, to: to, term: term} = meta
-    color = role_color(to)
+  def handle_event([:raft_ex, :state, :transition], _measurements, meta, _config) do
+    color = role_color(meta[:role])
+    node = format_node(meta[:node_id])
+    role = String.upcase(to_string(meta[:role]))
+    from = meta[:from_role]
+    term = meta[:term]
 
     IO.puts(
-      "#{@bold}#{color}[NODE #{inspect(node_id)}] [#{String.upcase(to_string(to))}]#{@reset} " <>
-        "#{@white}term=#{term} | #{from} → #{to}#{@reset}"
+      "#{color}#{bold()}#{node} [#{role}]#{reset()} term=#{term} | #{from} → #{meta[:role]}"
     )
   end
 
-  def handle_event([:raft_ex, :rpc, :sent], _measurements, meta, _config) do
-    %{node_id: node_id, to: to, rpc: rpc_type} = meta
-    role = Map.get(meta, :role, :unknown)
-
-    IO.puts(
-      "#{@cyan}[NODE #{inspect(node_id)}] [#{String.upcase(to_string(role))}]#{@reset} " <>
-        "→ SEND #{rpc_type} to #{inspect(to)}"
-    )
-  end
-
-  def handle_event([:raft_ex, :rpc, :reply_sent], _measurements, meta, _config) do
-    %{node_id: node_id, to: to, rpc: rpc_type} = meta
-    role = Map.get(meta, :role, :unknown)
-
-    IO.puts(
-      "#{@blue}[NODE #{inspect(node_id)}] [#{String.upcase(to_string(role))}]#{@reset} " <>
-        "← REPLY #{rpc_type} to #{inspect(to)}"
-    )
-  end
-
-  def handle_event([:raft_ex, :rpc, :received], _measurements, meta, _config) do
-    %{node_id: node_id, from: from, rpc: rpc_type} = meta
-    role = Map.get(meta, :role, :unknown)
-
-    IO.puts(
-      "#{@white}[NODE #{inspect(node_id)}] [#{String.upcase(to_string(role))}]#{@reset} " <>
-        "← RECV #{rpc_type} from #{inspect(from)}"
-    )
-  end
-
-  def handle_event([:raft_ex, :election, :timeout], _measurements, meta, _config) do
-    %{node_id: node_id, term: term} = meta
-
-    IO.puts(
-      "#{@yellow}[NODE #{inspect(node_id)}] [FOLLOWER]#{@reset} " <>
-        "⏰ election timeout fired, starting election for term #{term + 1}"
-    )
+  def handle_event([:raft_ex, :election, :start], _measurements, meta, _config) do
+    node = format_node(meta[:node_id])
+    term = meta[:term]
+    IO.puts("#{yellow()}#{node} [CANDIDATE] ⏰ election timeout → starting election term=#{term}#{reset()}")
   end
 
   def handle_event([:raft_ex, :election, :won], _measurements, meta, _config) do
-    %{node_id: node_id, term: term, votes: votes} = meta
-
-    IO.puts(
-      "#{@bold}#{@green}[NODE #{inspect(node_id)}] [LEADER]#{@reset} " <>
-        "🏆 WON election! term=#{term}, votes=#{votes}"
-    )
+    node = format_node(meta[:node_id])
+    term = meta[:term]
+    votes = meta[:votes]
+    IO.puts("#{green()}#{bold()}#{node} [LEADER] 🏆 WON election! term=#{term}, votes=#{votes}#{reset()}")
   end
 
   def handle_event([:raft_ex, :election, :lost], _measurements, meta, _config) do
-    %{node_id: node_id, term: term} = meta
+    node = format_node(meta[:node_id])
+    term = meta[:term]
+    IO.puts("#{red()}#{node} [FOLLOWER] ❌ lost election (higher term=#{term} seen)#{reset()}")
+  end
 
-    IO.puts(
-      "#{@red}[NODE #{inspect(node_id)}] [CANDIDATE]#{@reset} " <>
-        "✗ lost election, stepping down. term=#{term}"
-    )
+  def handle_event([:raft_ex, :vote, :granted], _measurements, meta, _config) do
+    node = format_node(meta[:node_id])
+    candidate = meta[:candidate_id]
+    term = meta[:term]
+    IO.puts("#{cyan()}#{node} [FOLLOWER] ✅ granted vote to #{candidate} for term=#{term}#{reset()}")
+  end
+
+  def handle_event([:raft_ex, :vote, :denied], _measurements, meta, _config) do
+    node = format_node(meta[:node_id])
+    candidate = meta[:candidate_id]
+    reason = meta[:reason]
+    IO.puts("#{white()}#{node} [FOLLOWER] ⛔ denied vote to #{candidate} (#{reason})#{reset()}")
+  end
+
+  def handle_event([:raft_ex, :rpc, :sent], _measurements, meta, _config) do
+    node = format_node(meta[:node_id])
+    to = meta[:to]
+    rpc = meta[:rpc]
+    IO.puts("#{blue()}#{node} → SEND #{rpc} to #{to}#{reset()}")
+  end
+
+  def handle_event([:raft_ex, :rpc, :reply_sent], _measurements, meta, _config) do
+    node = format_node(meta[:node_id])
+    to = meta[:to]
+    rpc = meta[:rpc]
+    IO.puts("#{blue()}#{node} ← REPLY #{rpc} to #{to}#{reset()}")
   end
 
   def handle_event([:raft_ex, :log, :appended], _measurements, meta, _config) do
-    %{node_id: node_id, index: index, term: term} = meta
-    role = Map.get(meta, :role, :leader)
-
-    IO.puts(
-      "#{@magenta}[NODE #{inspect(node_id)}] [#{String.upcase(to_string(role))}]#{@reset} " <>
-        "📝 log appended index=#{index} term=#{term}"
-    )
+    node = format_node(meta[:node_id])
+    index = meta[:index]
+    term = meta[:term]
+    cmd = inspect(meta[:command])
+    IO.puts("#{magenta()}#{node} [LEADER] 📝 appended index=#{index} term=#{term} cmd=#{cmd}#{reset()}")
   end
 
   def handle_event([:raft_ex, :log, :committed], _measurements, meta, _config) do
-    %{node_id: node_id, commit_index: commit_index} = meta
-    role = Map.get(meta, :role, :leader)
-
-    IO.puts(
-      "#{@green}[NODE #{inspect(node_id)}] [#{String.upcase(to_string(role))}]#{@reset} " <>
-        "✓ committed up to index=#{commit_index}"
-    )
+    node = format_node(meta[:node_id])
+    index = meta[:commit_index]
+    IO.puts("#{green()}#{bold()}#{node} ✔ COMMITTED up to index=#{index}#{reset()}")
   end
 
   def handle_event([:raft_ex, :log, :applied], _measurements, meta, _config) do
-    %{node_id: node_id, index: index, command: command} = meta
-    role = Map.get(meta, :role, :unknown)
-
-    IO.puts(
-      "#{@green}[NODE #{inspect(node_id)}] [#{String.upcase(to_string(role))}]#{@reset} " <>
-        "⚙  applied index=#{index} cmd=#{inspect(command)}"
-    )
+    node = format_node(meta[:node_id])
+    index = meta[:index]
+    result = inspect(meta[:result])
+    IO.puts("#{green()}#{node} ⚙ APPLIED index=#{index} result=#{result}#{reset()}")
   end
 
   def handle_event([:raft_ex, :snapshot, :created], _measurements, meta, _config) do
-    %{node_id: node_id, last_included_index: idx, last_included_term: term} = meta
-
-    IO.puts(
-      "#{@yellow}[NODE #{inspect(node_id)}] [LEADER]#{@reset} " <>
-        "📸 snapshot created last_index=#{idx} last_term=#{term}"
-    )
+    node = format_node(meta[:node_id])
+    idx = meta[:last_included_index]
+    term = meta[:last_included_term]
+    IO.puts("#{magenta()}#{node} 📸 SNAPSHOT created last_index=#{idx} last_term=#{term}#{reset()}")
   end
 
   def handle_event([:raft_ex, :snapshot, :installed], _measurements, meta, _config) do
-    %{node_id: node_id, last_included_index: idx} = meta
-
-    IO.puts(
-      "#{@yellow}[NODE #{inspect(node_id)}] [FOLLOWER]#{@reset} " <>
-        "📥 snapshot installed last_index=#{idx}"
-    )
+    node = format_node(meta[:node_id])
+    idx = meta[:last_included_index]
+    term = meta[:last_included_term]
+    IO.puts("#{magenta()}#{node} 📥 SNAPSHOT installed last_index=#{idx} last_term=#{term}#{reset()}")
   end
 
-  def handle_event([:raft_ex, :client, :command], _measurements, meta, _config) do
-    %{node_id: node_id, command: command} = meta
-
-    IO.puts(
-      "#{@white}[NODE #{inspect(node_id)}] [CLIENT]#{@reset} " <>
-        "→ command #{inspect(command)}"
-    )
-  end
-
-  def handle_event([:raft_ex, :client, :response], _measurements, meta, _config) do
-    %{node_id: node_id, result: result} = meta
-
-    IO.puts(
-      "#{@white}[NODE #{inspect(node_id)}] [CLIENT]#{@reset} " <>
-        "← response #{inspect(result)}"
-    )
-  end
-
-  # Catch-all for any unhandled events
-  def handle_event(event, _measurements, _meta, _config) do
-    Logger.debug("RaftEx.Inspector: unhandled event #{inspect(event)}")
+  def handle_event([:raft_ex, :heartbeat, :sent], _measurements, meta, _config) do
+    node = format_node(meta[:node_id])
+    to = meta[:to]
+    IO.puts("#{white()}#{node} [LEADER] 💓 heartbeat → #{to}#{reset()}")
   end
 
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp role_color(:leader), do: @green
-  defp role_color(:candidate), do: @yellow
+  defp format_node(node_id), do: "[NODE #{inspect(node_id)}]"
+
   defp role_color(:follower), do: @cyan
+  defp role_color(:candidate), do: @yellow
+  defp role_color(:leader), do: @green
   defp role_color(_), do: @white
+
+  defp bold(), do: @bold
+  defp reset(), do: @reset
+  defp yellow(), do: @yellow
+  defp green(), do: @green
+  defp red(), do: @red
+  defp cyan(), do: @cyan
+  defp magenta(), do: @magenta
+  defp blue(), do: @blue
+  defp white(), do: @white
 end

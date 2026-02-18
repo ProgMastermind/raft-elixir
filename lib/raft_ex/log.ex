@@ -292,8 +292,6 @@ defmodule RaftEx.Log do
     end
   end
 
-  defp append_remaining(_node_id, []), do: :ok
-
   defp append_remaining(node_id, entries) do
     tab = table_name(node_id)
 
