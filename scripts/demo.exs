@@ -293,32 +293,36 @@ end
 # ===========================================================================
 Demo.banner("§6 JOINT CONSENSUS — Cluster membership change (add/remove node)")
 
-active_leader = Demo.find_leader(cluster)
+# Always re-find leader right before submitting — elections may have happened
+joint_leader = Demo.find_leader(cluster)
 Demo.info("Current cluster: #{inspect(cluster)}")
-Demo.info("Current leader: #{inspect(active_leader)}")
+Demo.info("Current leader: #{inspect(joint_leader)}")
 
-# Add a new node
+# Add a new node — start it knowing the full new cluster
 new_node = :n4
+new_cluster = cluster ++ [new_node]
 Demo.step("Starting new node #{inspect(new_node)}...")
-{:ok, _} = RaftEx.start_node(new_node, cluster ++ [new_node])
+{:ok, _} = RaftEx.start_node(new_node, new_cluster)
 Process.sleep(200)
 
+# Re-find leader again (n4 may have triggered elections)
+joint_leader = Demo.find_leader(cluster)
 Demo.step("Submitting config_change to add #{inspect(new_node)} (§6 Phase 1: C_old,new)...")
-new_cluster = cluster ++ [new_node]
-result = RaftEx.Server.command(active_leader, {:config_change, new_cluster})
+result = RaftEx.Server.command(joint_leader, {:config_change, new_cluster})
 case result do
   {:ok, _} ->
     Demo.ok("config_change committed — joint consensus C_old,new → C_new complete (§6)")
-    Demo.ok("During joint consensus, majority required from BOTH old [n1,n2,n3] AND new [n1,n2,n3,n4]")
+    Demo.ok("During joint consensus, majority required from BOTH old AND new config")
   {:error, e} ->
     Demo.info("config_change result: #{inspect(e)}")
 end
 
-Process.sleep(300)
+Process.sleep(400)
 
-# Remove a node
+# Remove n4 — re-find leader again
+joint_leader = Demo.find_leader(cluster)
 Demo.step("Submitting config_change to remove #{inspect(new_node)} (§6 node removal)...")
-result2 = RaftEx.Server.command(active_leader, {:config_change, cluster})
+result2 = RaftEx.Server.command(joint_leader, {:config_change, cluster})
 case result2 do
   {:ok, _} ->
     Demo.ok("config_change committed — #{inspect(new_node)} removed from cluster (§6)")
@@ -327,14 +331,14 @@ case result2 do
     Demo.info("config_change result: #{inspect(e)}")
 end
 
-Process.sleep(400)
+Process.sleep(500)
 
 # Check if n4 shut down
-n4_pid = Process.whereis(:"raft_server_n4")
+n4_pid = Process.whereis(:raft_server_n4)
 if n4_pid == nil do
   Demo.ok("#{inspect(new_node)} shut down gracefully after removal from C_new (§6)")
 else
-  Demo.info("#{inspect(new_node)} still running (may still be processing shutdown)")
+  Demo.info("#{inspect(new_node)} still running — stopping manually")
   RaftEx.stop_node(new_node)
 end
 
