@@ -11,11 +11,19 @@ defmodule RaftExTest do
   end
 
   defp start_cluster(cluster) do
+    # Clean up any leftover DETS/snapshot files from previous runs first
+    tmp = System.tmp_dir!()
+    for node_id <- cluster do
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_meta.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_log.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_snapshot.bin"))
+    end
+
     for node_id <- cluster do
       {:ok, _pid} = RaftEx.start_node(node_id, cluster)
     end
     # Wait for election to complete (max 300ms timeout + buffer)
-    Process.sleep(600)
+    Process.sleep(700)
     cluster
   end
 

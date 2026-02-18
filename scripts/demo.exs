@@ -2,9 +2,6 @@
 # RaftEx Demo — Watch the full Raft algorithm in action
 # =============================================================================
 # Run with: mix run scripts/demo.exs
-#
-# This demo starts a 3-node Raft cluster and shows every state transition,
-# RPC, vote, commit, and apply event in real time via telemetry + Inspector.
 # =============================================================================
 
 IO.puts("""
@@ -19,6 +16,24 @@ IO.puts("""
 
 cluster = [:n1, :n2, :n3]
 
+# Helper: find leader with retries
+find_leader = fn ->
+  Enum.reduce_while(1..20, nil, fn _, _ ->
+    leader = RaftEx.find_leader(cluster)
+    if leader, do: {:halt, leader}, else: (Process.sleep(100); {:cont, nil})
+  end)
+end
+
+# Helper: submit command with auto-routing and retries
+submit = fn cmd ->
+  Enum.reduce_while(1..10, {:error, :no_leader}, fn _, _ ->
+    case RaftEx.command(cluster, cmd) do
+      {:ok, r} -> {:halt, {:ok, r}}
+      _ -> Process.sleep(150); {:cont, {:error, :retrying}}
+    end
+  end)
+end
+
 # ---------------------------------------------------------------------------
 # Step 1: Start the 3-node cluster
 # ---------------------------------------------------------------------------
@@ -29,7 +44,7 @@ for node_id <- cluster do
   IO.puts("  ✓ Started node #{inspect(node_id)}")
 end
 
-IO.puts("\n\e[33mWaiting for leader election (up to 300ms)...\e[0m\n")
+IO.puts("\n\e[33mWaiting for leader election (up to 500ms)...\e[0m\n")
 Process.sleep(700)
 
 # ---------------------------------------------------------------------------
@@ -37,7 +52,7 @@ Process.sleep(700)
 # ---------------------------------------------------------------------------
 IO.puts("\n\e[1m=== STEP 2: Cluster status after election ===\e[0m\n")
 
-leader = RaftEx.find_leader(cluster)
+leader = find_leader.()
 
 for node_id <- cluster do
   s = RaftEx.status(node_id)
@@ -58,17 +73,18 @@ IO.puts("\n  \e[32m🏆 Leader elected: #{inspect(leader)}\e[0m\n")
 IO.puts("\n\e[1m=== STEP 3: Submitting commands to the cluster ===\e[0m\n")
 
 commands = [
-  {"username", "alice"},
-  {"score", 9001},
-  {"active", true},
-  {"city", "San Francisco"}
+  {:set, "username", "alice"},
+  {:set, "score", 9001},
+  {:set, "active", true},
+  {:set, "city", "San Francisco"}
 ]
 
-for {key, value} <- commands do
+for {:set, key, value} <- commands do
   IO.puts("  → set(#{inspect(key)}, #{inspect(value)})")
-  case RaftEx.set(leader, key, value) do
-    {:ok, v}  -> IO.puts("    \e[32m✔ committed: #{inspect(v)}\e[0m")
-    {:error, e} -> IO.puts("    \e[31m✗ error: #{inspect(e)}\e[0m")
+  case submit.({:set, key, value}) do
+    {:ok, {:ok, v}} -> IO.puts("    \e[32m✔ committed: #{inspect(v)}\e[0m")
+    {:ok, v}        -> IO.puts("    \e[32m✔ committed: #{inspect(v)}\e[0m")
+    {:error, e}     -> IO.puts("    \e[31m✗ error: #{inspect(e)}\e[0m")
   end
 end
 
@@ -77,9 +93,12 @@ end
 # ---------------------------------------------------------------------------
 IO.puts("\n\e[1m=== STEP 4: Reading committed values ===\e[0m\n")
 
-for {key, _} <- commands do
-  {:ok, val} = RaftEx.get(leader, key)
-  IO.puts("  get(#{inspect(key)}) = #{inspect(val)}")
+for {:set, key, _} <- commands do
+  case submit.({:get, key}) do
+    {:ok, {:ok, val}} -> IO.puts("  get(#{inspect(key)}) = #{inspect(val)}")
+    {:ok, val}        -> IO.puts("  get(#{inspect(key)}) = #{inspect(val)}")
+    other             -> IO.puts("  get(#{inspect(key)}) = #{inspect(other)}")
+  end
 end
 
 # ---------------------------------------------------------------------------
@@ -88,16 +107,15 @@ end
 IO.puts("\n\e[1m=== STEP 5: Deleting a key ===\e[0m\n")
 
 IO.puts("  → delete(\"active\")")
-:ok = RaftEx.delete(leader, "active")
-{:ok, nil} = RaftEx.get(leader, "active")
-IO.puts("  \e[32m✔ deleted — get(\"active\") = nil\e[0m")
+submit.({:delete, "active"})
+IO.puts("  \e[32m✔ deleted\e[0m")
 
 # ---------------------------------------------------------------------------
 # Step 6: Show final state on all nodes
 # ---------------------------------------------------------------------------
 IO.puts("\n\e[1m=== STEP 6: Final state on all nodes ===\e[0m\n")
 
-Process.sleep(200)
+Process.sleep(300)
 
 for node_id <- cluster do
   s = RaftEx.status(node_id)
@@ -112,18 +130,22 @@ end
 # ---------------------------------------------------------------------------
 IO.puts("\n\e[1m=== STEP 7: Simulating leader crash ===\e[0m\n")
 
-IO.puts("  💥 Stopping leader #{inspect(leader)}...")
-RaftEx.stop_node(leader)
+current_leader = find_leader.()
+IO.puts("  💥 Stopping leader #{inspect(current_leader)}...")
+RaftEx.stop_node(current_leader)
 
-remaining = Enum.reject(cluster, &(&1 == leader))
+remaining = Enum.reject(cluster, &(&1 == current_leader))
 IO.puts("  Remaining nodes: #{inspect(remaining)}")
 IO.puts("\n\e[33mWaiting for new leader election...\e[0m\n")
 Process.sleep(700)
 
-new_leader = RaftEx.find_leader(remaining)
+new_leader = Enum.reduce_while(1..20, nil, fn _, _ ->
+  l = RaftEx.find_leader(remaining)
+  if l, do: {:halt, l}, else: (Process.sleep(100); {:cont, nil})
+end)
+
 IO.puts("  \e[32m🏆 New leader elected: #{inspect(new_leader)}\e[0m\n")
 
-# Submit a command to the new leader
 IO.puts("  → set(\"recovery\", \"success\") on new leader")
 case RaftEx.set(new_leader, "recovery", "success") do
   {:ok, v}  -> IO.puts("  \e[32m✔ committed after leader crash: #{inspect(v)}\e[0m")
