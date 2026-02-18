@@ -203,6 +203,11 @@ defmodule RaftEx.Server do
     {:keep_state, data, [{:reply, from, build_status(data, :follower)}]}
   end
 
+  # §6: node removed from cluster — shut down gracefully
+  def follower(:info, :shutdown_not_in_cluster, _data) do
+    {:stop, :normal}
+  end
+
   # ---------------------------------------------------------------------------
   # CANDIDATE state (§5.2)
   # ---------------------------------------------------------------------------
@@ -780,7 +785,15 @@ defmodule RaftEx.Server do
           {_, _, {:config_change, new_cluster}} ->
             :telemetry.execute([:raft_ex, :cluster, :config_change], %{count: 1},
               %{node_id: acc.node_id, new_cluster: new_cluster})
-            %{acc | cluster: new_cluster, joint_config: nil}
+            new_data = %{acc | cluster: new_cluster, joint_config: nil}
+            # §6: if this node is not in C_new, it must step down
+            if acc.node_id not in new_cluster do
+              :telemetry.execute([:raft_ex, :cluster, :removed], %{count: 1},
+                %{node_id: acc.node_id, new_cluster: new_cluster})
+              # Schedule self-stop after replying to pending calls
+              Process.send_after(self(), :shutdown_not_in_cluster, 100)
+            end
+            new_data
           _ ->
             acc
         end
