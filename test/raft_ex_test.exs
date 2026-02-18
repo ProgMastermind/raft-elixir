@@ -1,8 +1,6 @@
 defmodule RaftExTest do
-  use ExUnit.Case
-  doctest RaftEx
+  use ExUnit.Case, async: false
 
-  test "greets the world" do
-    assert RaftEx.hello() == :world
-  end
+  # Integration tests for the public RaftEx API are added in Phase 10.
+  # This file is intentionally minimal until the full implementation is complete.
 end
