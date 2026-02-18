@@ -365,9 +365,11 @@ defmodule RaftEx.Server do
       if reply.vote_granted and reply.term == data.current_term do
         votes = MapSet.put(data.votes_received, reply.from)
         data = %{data | votes_received: votes}
-        cluster_size = Cluster.size(data.cluster)
 
-        if Cluster.has_majority?(MapSet.size(votes), cluster_size) do
+        # §6: during joint consensus, require majority from BOTH old and new config
+        won = Cluster.has_joint_majority?(votes, data.cluster, data.joint_config)
+
+        if won do
           become_leader(data)
         else
           {:keep_state, data}
