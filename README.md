@@ -94,6 +94,21 @@ cluster = [:n1, :n2, :n3]
 Process.sleep(500)
 ```
 
+You can also provide explicit TCP endpoints:
+
+```elixir
+cluster = [:n1, :n2, :n3]
+endpoints = %{
+  n1: {"127.0.0.1", 31_001},
+  n2: {"127.0.0.1", 31_002},
+  n3: {"127.0.0.1", 31_003}
+}
+
+{:ok, _} = RaftEx.start_node(:n1, cluster, endpoints: endpoints)
+{:ok, _} = RaftEx.start_node(:n2, cluster, endpoints: endpoints)
+{:ok, _} = RaftEx.start_node(:n3, cluster, endpoints: endpoints)
+```
+
 ### Find the leader
 
 ```elixir

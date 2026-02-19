@@ -22,16 +22,22 @@ defmodule RaftEx do
       :ok       = RaftEx.delete(:n1, "x")
   """
 
-  alias RaftEx.Server
+  alias RaftEx.{Server, Transport}
 
   @doc """
   Start a Raft node with the given `node_id` and `cluster` list.
 
   The cluster list must include `node_id` itself. All nodes in the
   cluster must be started with the same cluster list.
+
+  Optional `opts`:
+  - `:endpoints` => `%{node_id => {host, port}}` TCP endpoint map.
   """
-  @spec start_node(atom(), [atom()]) :: {:ok, pid()} | {:error, term()}
-  def start_node(node_id, cluster) do
+  @spec start_node(atom(), [atom()], keyword()) :: {:ok, pid()} | {:error, term()}
+  def start_node(node_id, cluster, opts \\ []) do
+    endpoints = Keyword.get(opts, :endpoints, %{})
+    _ = Transport.ensure_cluster_endpoints(cluster, endpoints)
+
     DynamicSupervisor.start_child(
       RaftEx.NodeSupervisor,
       {Server, {node_id, cluster}}
