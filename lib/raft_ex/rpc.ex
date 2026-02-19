@@ -1,4 +1,5 @@
 defmodule RaftEx.RPC do
+  alias RaftEx.TcpTransport
   @moduledoc """
   Raft RPC message structs and dispatch layer. (§5.2, §5.3, §7)
 
@@ -254,17 +255,24 @@ defmodule RaftEx.RPC do
   """
   @spec send_rpc(atom(), atom(), term()) :: :ok
   def send_rpc(from_id, peer_id, rpc) do
-    name = server_name(peer_id)
-
     :telemetry.execute(
       [:raft_ex, :rpc, :sent],
       %{count: 1},
       %{node_id: from_id, to: peer_id, rpc: rpc.__struct__ |> Module.split() |> List.last()}
     )
 
-    case Process.whereis(name) do
-      nil -> :ok
-      pid -> :gen_statem.cast(pid, rpc)
+    case TcpTransport.send(peer_id, rpc) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        :telemetry.execute(
+          [:raft_ex, :transport, :send_error],
+          %{count: 1},
+          %{node_id: from_id, to: peer_id, reason: reason}
+        )
+
+        :ok
     end
   end
 
@@ -276,23 +284,24 @@ defmodule RaftEx.RPC do
   """
   @spec send_reply(atom(), atom(), term()) :: :ok
   def send_reply(from_id, peer_id, reply) do
-    name = server_name(peer_id)
-
     :telemetry.execute(
       [:raft_ex, :rpc, :reply_sent],
       %{count: 1},
       %{node_id: from_id, to: peer_id, rpc: reply.__struct__ |> Module.split() |> List.last()}
     )
 
-    case Process.whereis(name) do
-      nil -> :ok
-      pid -> :gen_statem.cast(pid, reply)
+    case TcpTransport.send(peer_id, reply) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        :telemetry.execute(
+          [:raft_ex, :transport, :send_error],
+          %{count: 1},
+          %{node_id: from_id, to: peer_id, reason: reason}
+        )
+
+        :ok
     end
   end
-
-  # ---------------------------------------------------------------------------
-  # Private helpers
-  # ---------------------------------------------------------------------------
-
-  defp server_name(node_id), do: :"raft_server_#{node_id}"
 end
