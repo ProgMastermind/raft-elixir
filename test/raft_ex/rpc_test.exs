@@ -198,10 +198,11 @@ defmodule RaftEx.RPCTest do
   # ---------------------------------------------------------------------------
 
   describe "InstallSnapshotReply (§7)" do
-    test "struct has term and from fields" do
-      reply = %InstallSnapshotReply{term: 3, from: :n2}
+    test "struct has term, from, and offset fields" do
+      reply = %InstallSnapshotReply{term: 3, from: :n2, offset: 128}
       assert reply.term == 3
       assert reply.from == :n2
+      assert reply.offset == 128
     end
   end
 end

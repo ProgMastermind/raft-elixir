@@ -8,7 +8,7 @@ defmodule RaftEx.TcpListener do
   alias RaftEx.Transport
 
   @accept_timeout_ms 1_000
-  @recv_timeout_ms 1_000
+  @recv_timeout_ms 3_000
 
   @spec start_link(atom()) :: {:ok, pid()} | {:error, term()}
   def start_link(node_id) do
@@ -66,22 +66,33 @@ defmodule RaftEx.TcpListener do
   end
 
   defp handle_connection(node_id, socket) do
-    result =
-      with {:ok, <<len::32-big>>} <- :gen_tcp.recv(socket, 4, @recv_timeout_ms),
-           {:ok, payload} <- :gen_tcp.recv(socket, len, @recv_timeout_ms),
-           {:ok, msg} <- safe_decode(payload) do
-        dispatch_to_server(node_id, msg)
-      end
+    loop_connection(node_id, socket)
+    :gen_tcp.close(socket)
+  end
 
-    case result do
-      :ok -> :ok
-      {:error, :closed} -> :ok
-      {:error, :timeout} -> :ok
+  defp loop_connection(node_id, socket) do
+    case read_one_message(socket) do
+      {:ok, msg} ->
+        _ = dispatch_to_server(node_id, msg)
+        loop_connection(node_id, socket)
+
+      {:error, :closed} ->
+        :ok
+
+      {:error, :timeout} ->
+        :ok
+
       {:error, reason} ->
         Logger.warning("[#{node_id}] tcp connection handling failed: #{inspect(reason)}")
     end
+  end
 
-    :gen_tcp.close(socket)
+  defp read_one_message(socket) do
+    with {:ok, <<len::32-big>>} <- :gen_tcp.recv(socket, 4, @recv_timeout_ms),
+         {:ok, payload} <- :gen_tcp.recv(socket, len, @recv_timeout_ms),
+         {:ok, msg} <- safe_decode(payload) do
+      {:ok, msg}
+    end
   end
 
   defp safe_decode(payload) do
