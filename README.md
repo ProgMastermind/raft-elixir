@@ -14,15 +14,16 @@ Every rule from the paper is implemented and cited. Every invariant has a test.
 | Paper Section | Feature |
 |---|---|
 | §5.1 | Persistent state — `currentTerm`, `votedFor`, `log[]` written to DETS before any RPC |
-| §5.2 | Leader election — randomized timeout (150–300ms), RequestVote, majority vote counting |
+| §5.2 | Leader election — randomized timeout (150–300ms), PreVote + RequestVote, majority vote counting |
 | §5.3 | Log replication — AppendEntries with all 5 receiver rules, `nextIndex`/`matchIndex` |
 | §5.4.1 | Election restriction — log up-to-date check (term first, then length) |
 | §5.4.2 | Commit discipline — leader only advances `commitIndex` for current-term entries |
 | §5.5 | Fault tolerance — follower crash, leader crash, automatic re-election and catch-up |
 | §5.6 | Timing — 50ms heartbeat `<<` 150–300ms election timeout |
 | §6 | Joint consensus — `C_old,new` two-phase membership change, graceful node removal |
-| §7 | Log compaction — snapshot create/load, `InstallSnapshot` RPC, log truncation |
+| §7 | Log compaction — snapshot create/load, chunked `InstallSnapshot` transfer, log truncation |
 | §8 | Client interaction — redirect to leader, no-op on election, linearizable reads |
+| Transport | TCP networking — length-prefixed framed RPC transport with connection reuse |
 
 ---
 
@@ -34,7 +35,11 @@ raft_ex_v2/
 │   ├── server.ex        # :gen_statem FSM — follower/candidate/leader roles
 │   ├── log.ex           # DETS-backed log storage
 │   ├── persistence.ex   # DETS-backed currentTerm + votedFor
-│   ├── rpc.ex           # Message structs (AppendEntries, RequestVote, InstallSnapshot)
+│   ├── rpc.ex           # Raft RPC structs + send facade
+│   ├── transport.ex     # Node endpoint resolution
+│   ├── tcp_transport.ex # Outbound framed TCP RPC sender
+│   ├── tcp_listener.ex  # Inbound TCP listener and decoder
+│   ├── tcp_connection_pool.ex # Reused outbound TCP socket pool
 │   ├── cluster.ex       # Peer list, majority/joint-majority helpers
 │   ├── state_machine.ex # KV store — set/get/delete
 │   ├── snapshot.ex      # Snapshot create/load/install
@@ -187,8 +192,21 @@ s = RaftEx.status(leader)
 Each node runs as a `:gen_statem` with three named state functions:
 
 - **`follower/3`** — default state; resets election timer on valid heartbeat or vote grant
+- **`pre_candidate/3`** — runs pre-vote probe to avoid unnecessary term bumps
 - **`candidate/3`** — increments term, votes for self, sends `RequestVote` to all peers
 - **`leader/3`** — sends heartbeats every 50ms, replicates log entries, advances `commitIndex`
+
+### Network transport
+
+Raft RPC traffic runs over TCP using binary framing:
+
+```
+<<payload_size::32-big, payload::binary>>
+payload = :erlang.term_to_binary(rpc_struct)
+```
+
+Outbound sends use a shared connection pool for socket reuse. Inbound listeners
+decode framed messages and dispatch to the local Raft server FSM.
 
 ### Persistence
 
@@ -231,7 +249,7 @@ Every event emits a `:telemetry` event and is printed by `RaftEx.Inspector`:
 ## Tests
 
 ```
-4 properties, 124 tests, 0 failures
+4 properties, 135 tests, 0 failures
 ```
 
 | File | What it tests |
@@ -245,6 +263,7 @@ Every event emits a `:telemetry` event and is printed by `RaftEx.Inspector`:
 | `server_unit_test.exs` | FSM logic — election, replication, commit |
 | `fault_tolerance_test.exs` | Leader crash, follower crash, network partition |
 | `joint_consensus_test.exs` | §6 node removal shutdown, joint majority voting |
+| `tcp_transport_test.exs` | TCP framing, partial frames, dropped connections, unreachable peers |
 
 ---
 
