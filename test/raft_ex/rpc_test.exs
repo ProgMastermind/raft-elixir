@@ -2,6 +2,8 @@ defmodule RaftEx.RPCTest do
   use ExUnit.Case, async: true
 
   alias RaftEx.RPC.{
+    PreVote,
+    PreVoteReply,
     RequestVote,
     RequestVoteReply,
     AppendEntries,
@@ -9,6 +11,33 @@ defmodule RaftEx.RPCTest do
     InstallSnapshot,
     InstallSnapshotReply
   }
+
+  # ---------------------------------------------------------------------------
+  # PreVote structs
+  # ---------------------------------------------------------------------------
+
+  describe "PreVote (pre-election optimization)" do
+    test "struct has all required fields" do
+      rpc = %PreVote{
+        term: 4,
+        candidate_id: :n2,
+        last_log_index: 8,
+        last_log_term: 3
+      }
+
+      assert rpc.term == 4
+      assert rpc.candidate_id == :n2
+      assert rpc.last_log_index == 8
+      assert rpc.last_log_term == 3
+    end
+
+    test "reply has term, grant flag, and sender" do
+      reply = %PreVoteReply{term: 5, vote_granted: true, from: :n1}
+      assert reply.term == 5
+      assert reply.vote_granted == true
+      assert reply.from == :n1
+    end
+  end
 
   # ---------------------------------------------------------------------------
   # §5.2, §5.4 — RequestVote struct
