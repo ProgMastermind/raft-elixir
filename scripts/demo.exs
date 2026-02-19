@@ -83,6 +83,12 @@ IO.puts("""
 """)
 
 cluster = [:n1, :n2, :n3]
+endpoints = %{
+  n1: {"127.0.0.1", 32_001},
+  n2: {"127.0.0.1", 32_002},
+  n3: {"127.0.0.1", 32_003},
+  n4: {"127.0.0.1", 32_004}
+}
 
 # Clean up any leftover DETS files from previous runs
 tmp = System.tmp_dir!()
@@ -98,7 +104,7 @@ end
 Demo.banner("§5.2 LEADER ELECTION — Starting 3-node cluster")
 
 for node_id <- cluster do
-  {:ok, _} = RaftEx.start_node(node_id, cluster)
+  {:ok, _} = RaftEx.start_node(node_id, cluster, endpoints: endpoints)
   Demo.ok("Started node #{inspect(node_id)}")
 end
 
@@ -198,7 +204,7 @@ Demo.ok("Committed with 2/3 nodes — majority (2) still reachable (§5.5)")
 
 # Restart the follower
 Demo.step("Restarting #{inspect(follower_to_kill)}...")
-{:ok, _} = RaftEx.start_node(follower_to_kill, cluster)
+{:ok, _} = RaftEx.start_node(follower_to_kill, cluster, endpoints: endpoints)
 Process.sleep(500)
 Demo.ok("Node restarted — leader will catch it up via AppendEntries (§5.5 idempotent retry)")
 
@@ -243,7 +249,7 @@ Demo.ok("Committed on new leader (§5.2)")
 
 # Restart the crashed leader
 Demo.step("Restarting old leader #{inspect(current_leader)} as follower...")
-{:ok, _} = RaftEx.start_node(current_leader, cluster)
+{:ok, _} = RaftEx.start_node(current_leader, cluster, endpoints: endpoints)
 Process.sleep(500)
 Demo.ok("Old leader rejoined as follower — caught up via AppendEntries")
 
@@ -302,7 +308,7 @@ Demo.info("Current leader: #{inspect(joint_leader)}")
 new_node = :n4
 new_cluster = cluster ++ [new_node]
 Demo.step("Starting new node #{inspect(new_node)}...")
-{:ok, _} = RaftEx.start_node(new_node, new_cluster)
+{:ok, _} = RaftEx.start_node(new_node, new_cluster, endpoints: endpoints)
 Process.sleep(200)
 
 # Re-find leader again (n4 may have triggered elections)
