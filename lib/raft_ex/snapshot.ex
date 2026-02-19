@@ -75,6 +75,7 @@ defmodule RaftEx.Snapshot do
       :ok ->
         # §7: discard log entries covered by the snapshot
         :ok = Log.truncate_up_to(node_id, last_included_index)
+        :ok = Log.set_snapshot_base(node_id, last_included_index, last_included_term)
 
         :telemetry.execute(
           [:raft_ex, :snapshot, :created],
@@ -136,6 +137,7 @@ defmodule RaftEx.Snapshot do
       :ok ->
         # §7: discard all log entries — snapshot supersedes them
         :ok = Log.truncate_up_to(node_id, last_included_index)
+        :ok = Log.set_snapshot_base(node_id, last_included_index, last_included_term)
 
         sm_state = RaftEx.StateMachine.deserialize(data)
 

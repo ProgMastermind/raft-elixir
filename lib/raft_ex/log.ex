@@ -85,7 +85,8 @@ defmodule RaftEx.Log do
   def term_at(node_id, index) do
     case get(node_id, index) do
       {_, term, _} -> term
-      nil -> nil
+      nil ->
+        if index == base_index(node_id), do: base_term(node_id), else: nil
     end
   end
 
@@ -94,11 +95,7 @@ defmodule RaftEx.Log do
   """
   @spec last_index(atom()) :: non_neg_integer()
   def last_index(node_id) do
-    # §5.3: first index is 1; 0 means empty log
-    case :dets.info(table_name(node_id), :size) do
-      0 -> 0
-      _ -> find_last_index(node_id)
-    end
+    max(find_last_entry_index(node_id), base_index(node_id))
   end
 
   @doc """
@@ -115,7 +112,9 @@ defmodule RaftEx.Log do
   """
   @spec length(atom()) :: non_neg_integer()
   def length(node_id) do
-    :dets.info(table_name(node_id), :size) || 0
+    table_name(node_id)
+    |> :dets.select([{{:"$1", :_, :_}, [], [true]}])
+    |> Kernel.length()
   end
 
   @doc """
@@ -278,17 +277,42 @@ defmodule RaftEx.Log do
     :ok
   end
 
+  @doc """
+  Persist the compaction base (snapshot boundary) for this log.
+  """
+  @spec set_snapshot_base(atom(), non_neg_integer(), non_neg_integer()) :: :ok
+  def set_snapshot_base(node_id, last_included_index, last_included_term) do
+    tab = table_name(node_id)
+    :ok = :dets.insert(tab, {:base_index, last_included_index})
+    :ok = :dets.insert(tab, {:base_term, last_included_term})
+    :ok = :dets.sync(tab)
+  end
+
   # ---------------------------------------------------------------------------
   # Private helpers
   # ---------------------------------------------------------------------------
 
-  defp find_last_index(node_id) do
+  defp find_last_entry_index(node_id) do
     tab = table_name(node_id)
     indices = :dets.select(tab, [{{:"$1", :_, :_}, [], [:"$1"]}])
 
     case indices do
       [] -> 0
       _ -> Enum.max(indices)
+    end
+  end
+
+  defp base_index(node_id) do
+    case :dets.lookup(table_name(node_id), :base_index) do
+      [{:base_index, idx}] -> idx
+      _ -> 0
+    end
+  end
+
+  defp base_term(node_id) do
+    case :dets.lookup(table_name(node_id), :base_term) do
+      [{:base_term, term}] -> term
+      _ -> 0
     end
   end
 

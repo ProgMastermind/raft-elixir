@@ -127,4 +127,42 @@ defmodule RaftEx.SnapshotTest do
       assert RaftEx.Snapshot.threshold() == 100
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # §7 — Automatic snapshotting in server flow
+  # ---------------------------------------------------------------------------
+
+  describe "automatic snapshot creation (§7)" do
+    test "leader auto-creates snapshot after threshold committed entries" do
+      node_id = :"auto_snap_#{:erlang.unique_integer([:positive])}"
+      cluster = [node_id]
+      tmp = System.tmp_dir!()
+
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_meta.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_log.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_snapshot.bin"))
+
+      {:ok, _} = RaftEx.start_node(node_id, cluster)
+      Process.sleep(400)
+
+      for i <- 1..(RaftEx.Snapshot.threshold() + 5) do
+        {:ok, _} = RaftEx.set(node_id, "k#{i}", i)
+      end
+
+      Process.sleep(250)
+
+      snap = RaftEx.Snapshot.load(node_id)
+      assert snap != nil
+      assert snap.last_included_index > 0
+
+      s = RaftEx.status(node_id)
+      assert snap.last_included_index <= s.last_applied
+
+      RaftEx.stop_node(node_id)
+      Process.sleep(50)
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_meta.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_log.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_snapshot.bin"))
+    end
+  end
 end
