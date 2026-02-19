@@ -37,6 +37,7 @@ defmodule RaftEx.Server do
   @election_timeout_min 150
   @election_timeout_max 300
   @heartbeat_interval   50
+  @snapshot_chunk_bytes 64 * 1024
 
   # ---------------------------------------------------------------------------
   # Data struct — all server state in one place
@@ -61,7 +62,9 @@ defmodule RaftEx.Server do
     # §6 Joint consensus — nil when not in transition
     # {old_cluster, new_cluster} during C_old,new phase
     :joint_config,  # {[atom()], [atom()]} | nil
-    :listener_pid   # pid | nil — inbound TCP listener
+    :listener_pid,  # pid | nil — inbound TCP listener
+    :snapshot_progress,   # %{peer => non_neg_integer()} leader chunk send offset
+    :snapshot_receive     # map | nil follower snapshot chunk accumulator
   ]
 
   # ---------------------------------------------------------------------------
@@ -154,7 +157,9 @@ defmodule RaftEx.Server do
       next_index: %{},
       match_index: %{},
       pending: %{},
-      listener_pid: listener_pid
+      listener_pid: listener_pid,
+      snapshot_progress: %{},
+      snapshot_receive: nil
     }
 
     :telemetry.execute([:raft_ex, :state, :transition], %{count: 1},
@@ -550,7 +555,8 @@ defmodule RaftEx.Server do
       next_index: next_index,
       match_index: match_index,
       leader_id: data.node_id,
-      votes_received: MapSet.new()
+      votes_received: MapSet.new(),
+      snapshot_progress: %{}
     }
 
     :telemetry.execute([:raft_ex, :election, :won], %{count: 1},
@@ -833,14 +839,21 @@ defmodule RaftEx.Server do
     # §7: if nextIndex <= snapshot's last_included_index, send InstallSnapshot
     snap = Snapshot.load(data.node_id)
     if snap != nil and next_idx <= snap.last_included_index do
+      offset = Map.get(data.snapshot_progress, peer, 0)
+      offset = if offset < 0 or offset > byte_size(snap.data), do: 0, else: offset
+      remaining = max(0, byte_size(snap.data) - offset)
+      chunk_len = min(@snapshot_chunk_bytes, remaining)
+      chunk = if chunk_len > 0, do: binary_part(snap.data, offset, chunk_len), else: <<>>
+      done = offset + byte_size(chunk) >= byte_size(snap.data)
+
       rpc = %InstallSnapshot{
         term: data.current_term,
         leader_id: data.node_id,
         last_included_index: snap.last_included_index,
         last_included_term: snap.last_included_term,
-        offset: 0,
-        data: snap.data,
-        done: true
+        offset: offset,
+        data: chunk,
+        done: done
       }
       RPC.send_rpc(data.node_id, peer, rpc)
     else
@@ -916,17 +929,26 @@ defmodule RaftEx.Server do
       {:next_state, :follower, data,
        [{:state_timeout, election_timeout(), :election_timeout}]}
     else
-      # §7: after snapshot installed, update nextIndex to last_included_index + 1
+      # §7: continue chunked snapshot transfer until follower acknowledges all bytes.
       snap = Snapshot.load(data.node_id)
       if snap != nil do
         peer = reply.from
-        new_next  = snap.last_included_index + 1
-        new_match = snap.last_included_index
-        data = %{data |
-          next_index:  Map.put(data.next_index, peer, new_next),
-          match_index: Map.put(data.match_index, peer, new_match)
-        }
-        {:keep_state, data}
+        ack_offset = max(0, reply.offset)
+
+        if ack_offset < byte_size(snap.data) do
+          data = %{data | snapshot_progress: Map.put(data.snapshot_progress, peer, ack_offset)}
+          send_append_entries_to(data, peer)
+          {:keep_state, data}
+        else
+          new_next  = snap.last_included_index + 1
+          new_match = snap.last_included_index
+          data = %{data |
+            next_index:  Map.put(data.next_index, peer, new_next),
+            match_index: Map.put(data.match_index, peer, new_match),
+            snapshot_progress: Map.delete(data.snapshot_progress, peer)
+          }
+          {:keep_state, data}
+        end
       else
         {:keep_state, data}
       end
@@ -1045,34 +1067,35 @@ defmodule RaftEx.Server do
     data = if rpc.term > data.current_term, do: step_down(data, rpc.term), else: data
 
     if rpc.term < data.current_term do
-      reply = %InstallSnapshotReply{term: data.current_term, from: data.node_id}
+      reply = %InstallSnapshotReply{term: data.current_term, from: data.node_id, offset: 0}
       RPC.send_reply(data.node_id, rpc.leader_id, reply)
       {:keep_state, data}
     else
-      snap = %{
-        last_included_index: rpc.last_included_index,
-        last_included_term:  rpc.last_included_term,
-        cluster: data.cluster,
-        data: rpc.data
-      }
+      {data, ack_offset, completed_snap} = append_snapshot_chunk(data, rpc)
 
-      {:ok, new_sm} = Snapshot.install(data.node_id, snap)
+      data =
+        case completed_snap do
+          nil ->
+            %{data | leader_id: rpc.leader_id}
 
-      new_commit = max(data.commit_index, rpc.last_included_index)
-      new_applied = max(data.last_applied, rpc.last_included_index)
+          snap ->
+            {:ok, new_sm} = Snapshot.install(data.node_id, snap)
+            new_commit = max(data.commit_index, rpc.last_included_index)
+            new_applied = max(data.last_applied, rpc.last_included_index)
 
-      data = %{data |
-        sm_state: new_sm,
-        commit_index: new_commit,
-        last_applied: new_applied,
-        leader_id: rpc.leader_id
-      }
+            %{data |
+              sm_state: new_sm,
+              commit_index: new_commit,
+              last_applied: new_applied,
+              leader_id: rpc.leader_id,
+              snapshot_receive: nil
+            }
+        end
 
-      reply = %InstallSnapshotReply{term: data.current_term, from: data.node_id}
+      reply = %InstallSnapshotReply{term: data.current_term, from: data.node_id, offset: ack_offset}
       RPC.send_reply(data.node_id, rpc.leader_id, reply)
 
-      {:next_state, :follower, data,
-       [{:state_timeout, election_timeout(), :election_timeout}]}
+      {:next_state, :follower, data, [{:state_timeout, election_timeout(), :election_timeout}]}
     end
   end
 
@@ -1177,6 +1200,49 @@ defmodule RaftEx.Server do
     else
       data
     end
+  end
+
+  defp append_snapshot_chunk(data, rpc) do
+    recv = data.snapshot_receive
+    meta = %{leader_id: rpc.leader_id, last_included_index: rpc.last_included_index, last_included_term: rpc.last_included_term}
+
+    cond do
+      rpc.offset == 0 ->
+        acc = Map.merge(meta, %{data: rpc.data, next_offset: byte_size(rpc.data)})
+        finalize_snapshot_chunk(data, acc, rpc.done)
+
+      is_map(recv) and snapshot_meta_matches?(recv, meta) and rpc.offset == recv.next_offset ->
+        new_data = recv.data <> rpc.data
+        acc = %{recv | data: new_data, next_offset: recv.next_offset + byte_size(rpc.data)}
+        finalize_snapshot_chunk(data, acc, rpc.done)
+
+      is_map(recv) ->
+        {data, recv.next_offset, nil}
+
+      true ->
+        {data, 0, nil}
+    end
+  end
+
+  defp finalize_snapshot_chunk(data, acc, true) do
+    snap = %{
+      last_included_index: acc.last_included_index,
+      last_included_term: acc.last_included_term,
+      cluster: data.cluster,
+      data: acc.data
+    }
+
+    {data, acc.next_offset, snap}
+  end
+
+  defp finalize_snapshot_chunk(data, acc, false) do
+    {%{data | snapshot_receive: acc}, acc.next_offset, nil}
+  end
+
+  defp snapshot_meta_matches?(recv, meta) do
+    recv.leader_id == meta.leader_id and
+      recv.last_included_index == meta.last_included_index and
+      recv.last_included_term == meta.last_included_term
   end
 
   defp election_timeout() do

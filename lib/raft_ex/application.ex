@@ -16,6 +16,8 @@ defmodule RaftEx.Application do
   @impl true
   def start(_type, _args) do
     children = [
+      RaftEx.TcpConnectionPool,
+
       # Telemetry-based event observer — must start before any Raft nodes
       # so that all state transitions and RPCs are captured from the start.
       RaftEx.Inspector,

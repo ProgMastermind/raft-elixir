@@ -231,15 +231,17 @@ defmodule RaftEx.RPC do
     InstallSnapshotReply — response to InstallSnapshot. (§7)
 
     Fields (§7):
-    - `term`  — currentTerm, for leader to update itself
-    - `from`  — node_id of the follower
+    - `term`   — currentTerm, for leader to update itself
+    - `from`   — node_id of the follower
+    - `offset` — number of snapshot bytes durably accepted
     """
-    @enforce_keys [:term, :from]
-    defstruct [:term, :from]
+    @enforce_keys [:term, :from, :offset]
+    defstruct [:term, :from, :offset]
 
     @type t :: %__MODULE__{
             term: non_neg_integer(),
-            from: atom()
+            from: atom(),
+            offset: non_neg_integer()
           }
   end
 

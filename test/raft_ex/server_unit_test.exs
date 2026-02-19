@@ -9,6 +9,7 @@ defmodule RaftEx.ServerUnitTest do
   use ExUnit.Case, async: false
   alias RaftEx.RPC.RequestVote
   alias RaftEx.RPC.AppendEntries
+  alias RaftEx.RPC.InstallSnapshot
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -470,6 +471,65 @@ defmodule RaftEx.ServerUnitTest do
       assert s.commit_index == 11
       assert s.last_applied == 11
       assert s.sm_state["snap_key"] == "snap_val"
+
+      RaftEx.stop_node(node_id)
+      Process.sleep(50)
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_meta.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_log.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_snapshot.bin"))
+    end
+
+    test "follower assembles chunked InstallSnapshot before install" do
+      node_id = :"snap_chunk_#{:erlang.unique_integer([:positive])}"
+      leader_id = :"#{node_id}_leader"
+      cluster = [node_id, leader_id]
+      tmp = System.tmp_dir!()
+
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_meta.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_log.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_snapshot.bin"))
+
+      {:ok, _} = RaftEx.start_node(node_id, cluster)
+
+      full_state = %{"k1" => "v1", "k2" => "v2", "k3" => "v3"}
+      full_binary = RaftEx.StateMachine.serialize(full_state)
+      split_at = div(byte_size(full_binary), 2)
+      chunk1 = binary_part(full_binary, 0, split_at)
+      chunk2 = binary_part(full_binary, split_at, byte_size(full_binary) - split_at)
+
+      rpc1 = %InstallSnapshot{
+        term: 3,
+        leader_id: leader_id,
+        last_included_index: 15,
+        last_included_term: 3,
+        offset: 0,
+        data: chunk1,
+        done: false
+      }
+
+      rpc2 = %InstallSnapshot{
+        term: 3,
+        leader_id: leader_id,
+        last_included_index: 15,
+        last_included_term: 3,
+        offset: byte_size(chunk1),
+        data: chunk2,
+        done: true
+      }
+
+      :gen_statem.cast(:"raft_server_#{node_id}", rpc1)
+      Process.sleep(60)
+      # Not installed yet; first chunk only.
+      mid = RaftEx.status(node_id)
+      assert mid.last_applied < 15
+
+      :gen_statem.cast(:"raft_server_#{node_id}", rpc2)
+      Process.sleep(120)
+
+      s = RaftEx.status(node_id)
+      assert s.commit_index == 15
+      assert s.last_applied == 15
+      assert s.sm_state == full_state
 
       RaftEx.stop_node(node_id)
       Process.sleep(50)

@@ -101,6 +101,36 @@ defmodule RaftEx.TcpTransportTest do
       RaftEx.stop_node(node_id)
       clean_node_files(node_id)
     end
+
+    test "listener accepts multiple framed messages on reused socket" do
+      node_id = :"tcp_reuse_#{:erlang.unique_integer([:positive])}"
+      cluster = [node_id]
+      clean_node_files(node_id)
+
+      {:ok, _} = RaftEx.start_node(node_id, cluster)
+
+      {host, port} = RaftEx.Transport.endpoint_for(node_id)
+      {:ok, socket} = :gen_tcp.connect(String.to_charlist(host), port, [:binary, active: false], 500)
+
+      rpc_a = %RequestVote{term: 13, candidate_id: :reuse_a, last_log_index: 0, last_log_term: 0}
+      payload_a = :erlang.term_to_binary(rpc_a)
+      frame_a = <<byte_size(payload_a)::32-big, payload_a::binary>>
+
+      rpc_b = %RequestVote{term: 14, candidate_id: :reuse_b, last_log_index: 0, last_log_term: 0}
+      payload_b = :erlang.term_to_binary(rpc_b)
+      frame_b = <<byte_size(payload_b)::32-big, payload_b::binary>>
+
+      :ok = :gen_tcp.send(socket, frame_a)
+      :ok = :gen_tcp.send(socket, frame_b)
+      :gen_tcp.close(socket)
+
+      Process.sleep(120)
+      s = RaftEx.status(node_id)
+      assert s.current_term >= 14
+
+      RaftEx.stop_node(node_id)
+      clean_node_files(node_id)
+    end
   end
 end
 
