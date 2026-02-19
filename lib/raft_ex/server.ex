@@ -598,7 +598,9 @@ defmodule RaftEx.Server do
     data = case cmd do
       {:config_change, new_cluster} ->
         # §6: Phase 1 — enter joint consensus C_old,new
-        %{data | joint_config: {data.cluster, new_cluster}}
+        data
+        |> Map.put(:joint_config, {data.cluster, new_cluster})
+        |> ensure_replication_state()
       _ ->
         data
     end
@@ -632,7 +634,9 @@ defmodule RaftEx.Server do
   end
 
   defp do_send_heartbeats(data) do
-    for peer <- Cluster.peers(data.cluster, data.node_id) do
+    data = ensure_replication_state(data)
+
+    for peer <- replication_peers(data) do
       send_append_entries_to(data, peer)
       :telemetry.execute([:raft_ex, :heartbeat, :sent], %{count: 1},
         %{node_id: data.node_id, to: peer})
@@ -641,7 +645,9 @@ defmodule RaftEx.Server do
   end
 
   defp replicate_to_peers(data) do
-    for peer <- Cluster.peers(data.cluster, data.node_id) do
+    data = ensure_replication_state(data)
+
+    for peer <- replication_peers(data) do
       send_append_entries_to(data, peer)
     end
     data
@@ -763,8 +769,17 @@ defmodule RaftEx.Server do
     # §5.3: find highest N such that majority have matchIndex >= N
     # and log[N].term == currentTerm (§5.4.2)
     leader_match = Log.last_index(data.node_id)
-    all_match = [leader_match | Map.values(data.match_index)]
-    quorum_n = Cluster.quorum_match_index(all_match)
+
+    quorum_n =
+      case data.joint_config do
+        nil ->
+          all_match = [leader_match | Map.values(data.match_index)]
+          Cluster.quorum_match_index(all_match)
+
+        _ ->
+          # §6: during joint consensus, commit requires both majorities.
+          Cluster.joint_quorum_match_index(data.match_index, data.node_id, data.joint_config)
+      end
 
     # §5.4.2: only commit entries from current term
     entry_term = Log.term_at(data.node_id, quorum_n)
@@ -799,7 +814,9 @@ defmodule RaftEx.Server do
           {_, _, {:config_change, new_cluster}} ->
             :telemetry.execute([:raft_ex, :cluster, :config_change], %{count: 1},
               %{node_id: acc.node_id, new_cluster: new_cluster})
-            new_data = %{acc | cluster: new_cluster, joint_config: nil}
+            new_data =
+              %{acc | cluster: new_cluster, joint_config: nil}
+              |> compact_replication_state()
             # §6: if this node is not in C_new, it must step down
             if acc.node_id not in new_cluster do
               :telemetry.execute([:raft_ex, :cluster, :removed], %{count: 1},
@@ -885,6 +902,49 @@ defmodule RaftEx.Server do
 
   defp maybe_update_term(data, term) do
     if term > data.current_term, do: step_down(data, term), else: data
+  end
+
+  defp replication_peers(data) do
+    case data.joint_config do
+      nil ->
+        Cluster.peers(data.cluster, data.node_id)
+
+      {old_cluster, new_cluster} ->
+        Cluster.joint_peers(old_cluster, new_cluster, data.node_id)
+    end
+  end
+
+  defp ensure_replication_state(data) do
+    peers = replication_peers(data)
+    last_index = Log.last_index(data.node_id)
+
+    next_index =
+      Enum.reduce(peers, data.next_index, fn peer, acc ->
+        Map.put_new(acc, peer, last_index + 1)
+      end)
+
+    match_index =
+      Enum.reduce(peers, data.match_index, fn peer, acc ->
+        Map.put_new(acc, peer, 0)
+      end)
+
+    %{data | next_index: next_index, match_index: match_index}
+  end
+
+  defp compact_replication_state(data) do
+    peers = MapSet.new(Cluster.peers(data.cluster, data.node_id))
+
+    next_index =
+      data.next_index
+      |> Enum.filter(fn {peer, _idx} -> MapSet.member?(peers, peer) end)
+      |> Map.new()
+
+    match_index =
+      data.match_index
+      |> Enum.filter(fn {peer, _idx} -> MapSet.member?(peers, peer) end)
+      |> Map.new()
+
+    %{data | next_index: next_index, match_index: match_index}
   end
 
   defp election_timeout() do

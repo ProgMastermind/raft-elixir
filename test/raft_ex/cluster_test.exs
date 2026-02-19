@@ -93,6 +93,37 @@ defmodule RaftEx.ClusterTest do
   end
 
   # ---------------------------------------------------------------------------
+  # §6 — joint_quorum_match_index
+  # ---------------------------------------------------------------------------
+
+  describe "joint_quorum_match_index (§6)" do
+    test "requires both old and new majority thresholds" do
+      old_cluster = [:n1, :n2, :n3]
+      new_cluster = [:n1, :n2]
+      joint = {old_cluster, new_cluster}
+
+      # n1 is leader (self), n2 replicated to 7, n3 lagging at 2.
+      # old quorum index = 7 (from [self,7,2] -> second highest = 7)
+      # new quorum index = 7 (from [self,7] -> second highest = 7)
+      # joint commit index = min(7, 7) = 7
+      match_map = %{n2: 7, n3: 2}
+      assert RaftEx.Cluster.joint_quorum_match_index(match_map, :n1, joint) == 7
+    end
+
+    test "returns lower index if one config lags" do
+      old_cluster = [:n1, :n2, :n3]
+      new_cluster = [:n1, :n2, :n4]
+      joint = {old_cluster, new_cluster}
+
+      # old quorum from [self,8,3] -> 8
+      # new quorum from [self,8,1] -> 8
+      # reduce n2 to 4 to force both quorums to 4
+      match_map = %{n2: 4, n3: 3, n4: 1}
+      assert RaftEx.Cluster.joint_quorum_match_index(match_map, :n1, joint) == 4
+    end
+  end
+
+  # ---------------------------------------------------------------------------
   # StreamData property test — quorum correctness
   # ---------------------------------------------------------------------------
 
