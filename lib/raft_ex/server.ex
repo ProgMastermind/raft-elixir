@@ -31,6 +31,7 @@ defmodule RaftEx.Server do
   alias RaftEx.{Cluster, Log, Persistence, RPC, Snapshot, StateMachine}
   alias RaftEx.RPC.{AppendEntries, AppendEntriesReply, PreVote, PreVoteReply, RequestVote,
                     RequestVoteReply, InstallSnapshot, InstallSnapshotReply}
+  alias RaftEx.TcpListener
 
   # §5.2, §5.6 — timing constants
   @election_timeout_min 150
@@ -59,7 +60,8 @@ defmodule RaftEx.Server do
     :pending,       # %{log_index => {from, command}}
     # §6 Joint consensus — nil when not in transition
     # {old_cluster, new_cluster} during C_old,new phase
-    :joint_config   # {[atom()], [atom()]} | nil
+    :joint_config,  # {[atom()], [atom()]} | nil
+    :listener_pid   # pid | nil — inbound TCP listener
   ]
 
   # ---------------------------------------------------------------------------
@@ -119,6 +121,8 @@ defmodule RaftEx.Server do
 
   @impl :gen_statem
   def init({node_id, cluster}) do
+    {:ok, listener_pid} = TcpListener.start_link(node_id)
+
     # §5.1: open persistent storage
     {:ok, _} = Persistence.open(node_id)
     {:ok, _} = Log.open(node_id)
@@ -149,7 +153,8 @@ defmodule RaftEx.Server do
       votes_received: MapSet.new(),
       next_index: %{},
       match_index: %{},
-      pending: %{}
+      pending: %{},
+      listener_pid: listener_pid
     }
 
     :telemetry.execute([:raft_ex, :state, :transition], %{count: 1},
@@ -157,6 +162,17 @@ defmodule RaftEx.Server do
 
     # §5.2: start as follower with random election timeout
     {:ok, :follower, data, [{:state_timeout, election_timeout(), :election_timeout}]}
+  end
+
+  @impl :gen_statem
+  def terminate(_reason, _state, data) do
+    if is_pid(data.listener_pid) and Process.alive?(data.listener_pid) do
+      Process.exit(data.listener_pid, :normal)
+    end
+
+    _ = Persistence.close(data.node_id)
+    _ = Log.close(data.node_id)
+    :ok
   end
 
   # ---------------------------------------------------------------------------
@@ -451,7 +467,7 @@ defmodule RaftEx.Server do
     end
   end
 
-  defp start_election(data, from_role \\ :follower) do
+  defp start_election(data, from_role) do
     # §5.2: increment currentTerm, vote for self, reset election timer
     new_term = data.current_term + 1
 
