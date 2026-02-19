@@ -36,6 +36,39 @@ defmodule RaftEx.RPC do
   """
 
   # ---------------------------------------------------------------------------
+  # PreVote (optimization before §5.2 election)
+  # ---------------------------------------------------------------------------
+
+  defmodule PreVote do
+    @moduledoc """
+    PreVote RPC — probe for election viability before incrementing term.
+    """
+    @enforce_keys [:term, :candidate_id, :last_log_index, :last_log_term]
+    defstruct [:term, :candidate_id, :last_log_index, :last_log_term]
+
+    @type t :: %__MODULE__{
+            term: non_neg_integer(),
+            candidate_id: atom(),
+            last_log_index: non_neg_integer(),
+            last_log_term: non_neg_integer()
+          }
+  end
+
+  defmodule PreVoteReply do
+    @moduledoc """
+    PreVoteReply — response to PreVote viability probe.
+    """
+    @enforce_keys [:term, :vote_granted, :from]
+    defstruct [:term, :vote_granted, :from]
+
+    @type t :: %__MODULE__{
+            term: non_neg_integer(),
+            vote_granted: boolean(),
+            from: atom()
+          }
+  end
+
+  # ---------------------------------------------------------------------------
   # RequestVote (§5.2, §5.4)
   # ---------------------------------------------------------------------------
 

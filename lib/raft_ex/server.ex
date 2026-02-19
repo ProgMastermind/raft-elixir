@@ -29,8 +29,8 @@ defmodule RaftEx.Server do
   require Logger
 
   alias RaftEx.{Cluster, Log, Persistence, RPC, Snapshot, StateMachine}
-  alias RaftEx.RPC.{AppendEntries, AppendEntriesReply, RequestVote, RequestVoteReply,
-                    InstallSnapshot, InstallSnapshotReply}
+  alias RaftEx.RPC.{AppendEntries, AppendEntriesReply, PreVote, PreVoteReply, RequestVote,
+                    RequestVoteReply, InstallSnapshot, InstallSnapshotReply}
 
   # §5.2, §5.6 — timing constants
   @election_timeout_min 150
@@ -164,8 +164,17 @@ defmodule RaftEx.Server do
   # ---------------------------------------------------------------------------
 
   def follower(:state_timeout, :election_timeout, data) do
-    # §5.2: election timeout fires — convert to candidate
-    start_election(data)
+    # Run a pre-vote round before incrementing term to avoid churn.
+    start_pre_vote(data, :follower)
+  end
+
+  # PreVote viability probe
+  def follower(:cast, %PreVote{} = rpc, data) do
+    handle_pre_vote(rpc, data)
+  end
+
+  def follower(:cast, %PreVoteReply{}, data) do
+    {:keep_state, data}
   end
 
   # AppendEntries from leader (§5.3)
@@ -209,13 +218,65 @@ defmodule RaftEx.Server do
   end
 
   # ---------------------------------------------------------------------------
+  # PRE_CANDIDATE state (pre-vote optimization)
+  # ---------------------------------------------------------------------------
+
+  def pre_candidate(:state_timeout, :election_timeout, data) do
+    start_pre_vote(data, :pre_candidate)
+  end
+
+  def pre_candidate(:cast, %PreVoteReply{} = reply, data) do
+    handle_pre_vote_reply(reply, data)
+  end
+
+  def pre_candidate(:cast, %PreVote{} = rpc, data) do
+    handle_pre_vote(rpc, data)
+  end
+
+  def pre_candidate(:cast, %AppendEntries{} = rpc, data) do
+    if rpc.term >= data.current_term do
+      data = maybe_update_term(data, rpc.term)
+      handle_append_entries(rpc, data, :pre_candidate)
+    else
+      {:keep_state, data}
+    end
+  end
+
+  def pre_candidate(:cast, %RequestVote{} = rpc, data) do
+    handle_request_vote(rpc, data, :pre_candidate)
+  end
+
+  def pre_candidate(:cast, %AppendEntriesReply{}, data), do: {:keep_state, data}
+  def pre_candidate(:cast, %RequestVoteReply{}, data), do: {:keep_state, data}
+  def pre_candidate(:cast, %InstallSnapshotReply{}, data), do: {:keep_state, data}
+  def pre_candidate(:cast, %InstallSnapshot{} = rpc, data), do: handle_install_snapshot(rpc, data)
+
+  def pre_candidate({:call, from}, {:command, _cmd}, data) do
+    {:keep_state, data, [{:reply, from, {:error, {:redirect, data.leader_id}}}]}
+  end
+
+  def pre_candidate({:call, from}, :status, data) do
+    {:keep_state, data, [{:reply, from, build_status(data, :pre_candidate)}]}
+  end
+
+  def pre_candidate(:info, :shutdown_not_in_cluster, _data) do
+    {:stop, :normal}
+  end
+
+  # ---------------------------------------------------------------------------
   # CANDIDATE state (§5.2)
   # ---------------------------------------------------------------------------
 
   def candidate(:state_timeout, :election_timeout, data) do
-    # §5.2: split vote — restart election with new term
-    start_election(data)
+    # Timeout without leader — run another pre-vote round.
+    start_pre_vote(data, :candidate)
   end
+
+  def candidate(:cast, %PreVote{} = rpc, data) do
+    handle_pre_vote(rpc, data)
+  end
+
+  def candidate(:cast, %PreVoteReply{}, data), do: {:keep_state, data}
 
   # RequestVoteReply — count votes (§5.2)
   def candidate(:cast, %RequestVoteReply{} = reply, data) do
@@ -297,7 +358,12 @@ defmodule RaftEx.Server do
     handle_request_vote(rpc, data, :leader)
   end
 
+  def leader(:cast, %PreVote{} = rpc, data) do
+    handle_pre_vote(rpc, data)
+  end
+
   def leader(:cast, %RequestVoteReply{}, data), do: {:keep_state, data}
+  def leader(:cast, %PreVoteReply{}, data), do: {:keep_state, data}
   def leader(:cast, %InstallSnapshot{}, data), do: {:keep_state, data}
 
   def leader({:call, from}, :status, data) do
@@ -319,7 +385,73 @@ defmodule RaftEx.Server do
   # Election helpers (§5.2, §5.4)
   # ---------------------------------------------------------------------------
 
-  defp start_election(data) do
+  defp start_pre_vote(data, from_role) do
+    next_term = data.current_term + 1
+    last_log_index = Log.last_index(data.node_id)
+    last_log_term = Log.last_term(data.node_id)
+
+    rpc = %PreVote{
+      term: next_term,
+      candidate_id: data.node_id,
+      last_log_index: last_log_index,
+      last_log_term: last_log_term
+    }
+
+    for peer <- Cluster.peers(data.cluster, data.node_id) do
+      RPC.send_rpc(data.node_id, peer, rpc)
+    end
+
+    votes = MapSet.new([data.node_id])
+    data = %{data | votes_received: votes, leader_id: nil}
+
+    :telemetry.execute([:raft_ex, :state, :transition], %{count: 1},
+      %{node_id: data.node_id, role: :pre_candidate, from_role: from_role, term: data.current_term})
+
+    if Cluster.has_joint_majority?(votes, data.cluster, data.joint_config) do
+      start_election(data, :pre_candidate)
+    else
+      {:next_state, :pre_candidate, data,
+       [{:state_timeout, election_timeout(), :election_timeout}]}
+    end
+  end
+
+  defp handle_pre_vote(%PreVote{} = rpc, data) do
+    grant? =
+      rpc.term >= data.current_term and
+        log_up_to_date?(rpc.last_log_term, rpc.last_log_index, data.node_id)
+
+    reply = %PreVoteReply{
+      term: data.current_term,
+      vote_granted: grant?,
+      from: data.node_id
+    }
+
+    RPC.send_reply(data.node_id, rpc.candidate_id, reply)
+    {:keep_state, data}
+  end
+
+  defp handle_pre_vote_reply(%PreVoteReply{} = reply, data) do
+    if reply.term > data.current_term do
+      data = step_down(data, reply.term)
+      {:next_state, :follower, data, [{:state_timeout, election_timeout(), :election_timeout}]}
+    else
+      if reply.vote_granted do
+        votes = MapSet.put(data.votes_received, reply.from)
+        data = %{data | votes_received: votes}
+        won = Cluster.has_joint_majority?(votes, data.cluster, data.joint_config)
+
+        if won do
+          start_election(data, :pre_candidate)
+        else
+          {:keep_state, data}
+        end
+      else
+        {:keep_state, data}
+      end
+    end
+  end
+
+  defp start_election(data, from_role \\ :follower) do
     # §5.2: increment currentTerm, vote for self, reset election timer
     new_term = data.current_term + 1
 
@@ -338,7 +470,7 @@ defmodule RaftEx.Server do
       %{node_id: data.node_id, term: new_term})
 
     :telemetry.execute([:raft_ex, :state, :transition], %{count: 1},
-      %{node_id: data.node_id, role: :candidate, from_role: :follower, term: new_term})
+      %{node_id: data.node_id, role: :candidate, from_role: from_role, term: new_term})
 
     # §5.2: send RequestVote to all peers
     last_log_index = Log.last_index(data.node_id)
