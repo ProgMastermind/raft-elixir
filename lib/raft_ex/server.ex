@@ -839,7 +839,11 @@ defmodule RaftEx.Server do
       end)
 
       last_applied = data.commit_index
-      %{data | sm_state: new_sm, last_applied: last_applied}
+      data =
+        %{data | sm_state: new_sm, last_applied: last_applied}
+        |> maybe_create_snapshot()
+
+      data
     else
       data
     end
@@ -960,6 +964,31 @@ defmodule RaftEx.Server do
       end)
 
     %{data | next_index: next_index, match_index: match_index}
+  end
+
+  defp maybe_create_snapshot(data) do
+    if data.last_applied > 0 and Snapshot.should_snapshot?(data.node_id) do
+      case Log.term_at(data.node_id, data.last_applied) do
+        nil ->
+          data
+
+        last_term ->
+          case Snapshot.create(
+                 data.node_id,
+                 data.last_applied,
+                 last_term,
+                 data.sm_state,
+                 data.cluster
+               ) do
+            {:ok, _snapshot} -> data
+            {:error, reason} ->
+              Logger.warning("[#{data.node_id}] snapshot create failed: #{inspect(reason)}")
+              data
+          end
+      end
+    else
+      data
+    end
   end
 
   defp election_timeout() do
