@@ -84,13 +84,20 @@ defmodule RaftEx.JointConsensusTest do
       result = RaftEx.Server.command(leader, {:config_change, new_cluster})
       assert match?({:ok, _}, result)
 
-      # Wait for the config_change to be committed and n3 to shut down
-      # n3 gets the AppendEntries, applies the config_change, sees it's not in C_new,
-      # and schedules :shutdown_not_in_cluster after 100ms
-      Process.sleep(500)
+      # Wait for the config transition to complete and n3 to shut down.
+      # With two-step membership entries this can take multiple heartbeats.
+      pid_after =
+        Enum.reduce_while(1..40, nil, fn _, _ ->
+          pid = Process.whereis(:"raft_server_#{n3}")
+          if pid == nil do
+            {:halt, nil}
+          else
+            Process.sleep(50)
+            {:cont, pid}
+          end
+        end)
 
       # n3 should now be dead
-      pid_after = Process.whereis(:"raft_server_#{n3}")
       assert pid_after == nil,
         "Expected n3 to shut down after being removed from C_new, but it's still running"
 
@@ -186,10 +193,20 @@ defmodule RaftEx.JointConsensusTest do
       # The new cluster includes 2 extra nodes that don't exist yet
       [n1, n2, n3] = cluster
       new_cluster = [n1, n2, n3]  # same cluster — safe joint consensus test
+      before_last_index = RaftEx.status(leader).log_last_index
       {:ok, _} = RaftEx.Server.command(leader, {:config_change, new_cluster})
 
       # After commit, joint_config should be cleared (C_new committed)
       Process.sleep(300)
+
+      joint_index = before_last_index + 1
+      final_index = before_last_index + 2
+
+      assert {^joint_index, _, {:config_change_joint, _, ^new_cluster}} =
+               RaftEx.Log.get(leader, joint_index)
+
+      assert {^final_index, _, {:config_change_finalize, ^new_cluster}} =
+               RaftEx.Log.get(leader, final_index)
 
       # Cluster should still work normally
       {:ok, "test_value"} = RaftEx.set(leader, "joint_test", "test_value")

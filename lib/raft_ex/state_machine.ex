@@ -28,7 +28,14 @@ defmodule RaftEx.StateMachine do
   """
 
   @type state :: %{optional(term()) => term()}
-  @type command :: {:set, term(), term()} | {:get, term()} | {:delete, term()} | {:noop}
+  @type command ::
+          {:set, term(), term()}
+          | {:get, term()}
+          | {:delete, term()}
+          | {:noop}
+          | {:config_change, [atom()]}
+          | {:config_change_joint, [atom()], [atom()]}
+          | {:config_change_finalize, [atom()]}
   @type result :: {:ok, term()} | :ok
 
   @doc """
@@ -64,6 +71,14 @@ defmodule RaftEx.StateMachine do
 
   def apply_command(state, {:config_change, _new_cluster}) do
     # §6: cluster membership change — handled at server level, not KV level
+    {state, :ok}
+  end
+
+  def apply_command(state, {:config_change_joint, _old_cluster, _new_cluster}) do
+    {state, :ok}
+  end
+
+  def apply_command(state, {:config_change_finalize, _new_cluster}) do
     {state, :ok}
   end
 

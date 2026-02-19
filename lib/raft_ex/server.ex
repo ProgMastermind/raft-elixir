@@ -594,18 +594,41 @@ defmodule RaftEx.Server do
   # Leader: client command handling (§5.3, §8)
   # ---------------------------------------------------------------------------
 
-  defp handle_client_command(from, cmd, data) do
-    # §6: handle membership change commands specially
-    data = case cmd do
-      {:config_change, new_cluster} ->
-        # §6: Phase 1 — enter joint consensus C_old,new
-        data
-        |> Map.put(:joint_config, {data.cluster, new_cluster})
-        |> ensure_replication_state()
-      _ ->
-        data
-    end
+  defp handle_client_command(from, {:config_change, new_cluster} = cmd, data) do
+    if data.joint_config != nil do
+      {:keep_state, data, [{:reply, from, {:error, :config_change_in_progress}}]}
+    else
+      old_cluster = data.cluster
+      joint_cmd = {:config_change_joint, old_cluster, new_cluster}
+      final_cmd = {:config_change_finalize, new_cluster}
 
+      data =
+        data
+        |> Map.put(:joint_config, {old_cluster, new_cluster})
+        |> ensure_replication_state()
+
+      # §6: append C_old,new transition entry first.
+      {:ok, joint_index} = Log.append(data.node_id, data.current_term, joint_cmd)
+      :telemetry.execute([:raft_ex, :log, :appended], %{count: 1},
+        %{node_id: data.node_id, index: joint_index, term: data.current_term, command: joint_cmd})
+
+      # §6: append C_new finalization entry.
+      {:ok, final_index} = Log.append(data.node_id, data.current_term, final_cmd)
+      :telemetry.execute([:raft_ex, :log, :appended], %{count: 1},
+        %{node_id: data.node_id, index: final_index, term: data.current_term, command: final_cmd})
+
+      # Reply to client only after final C_new entry commits.
+      pending = Map.put(data.pending, final_index, {from, cmd})
+      data = %{data | pending: pending}
+
+      data = replicate_to_peers(data)
+      data = maybe_advance_commit(data)
+
+      {:keep_state, data, [{:timeout, @heartbeat_interval, :heartbeat}]}
+    end
+  end
+
+  defp handle_client_command(from, cmd, data) do
     # §5.3: leader appends entry to its log
     {:ok, index} = Log.append(data.node_id, data.current_term, cmd)
 
@@ -810,9 +833,16 @@ defmodule RaftEx.Server do
         :telemetry.execute([:raft_ex, :log, :applied], %{count: 1},
           %{node_id: acc.node_id, index: index, result: result})
 
-        # §6: if this was a config_change entry, complete the transition to C_new
+        # §6: membership entries are handled at server level.
         acc = case Log.get(acc.node_id, index) do
-          {_, _, {:config_change, new_cluster}} ->
+          {_, _, {:config_change_joint, old_cluster, new_cluster}} ->
+            :telemetry.execute([:raft_ex, :cluster, :config_change_joint], %{count: 1},
+              %{node_id: acc.node_id, old_cluster: old_cluster, new_cluster: new_cluster})
+            acc
+            |> Map.put(:joint_config, {old_cluster, new_cluster})
+            |> ensure_replication_state()
+
+          {_, _, {:config_change_finalize, new_cluster}} ->
             :telemetry.execute([:raft_ex, :cluster, :config_change], %{count: 1},
               %{node_id: acc.node_id, new_cluster: new_cluster})
             new_data = %{acc | cluster: new_cluster, joint_config: nil}
@@ -821,6 +851,16 @@ defmodule RaftEx.Server do
               :telemetry.execute([:raft_ex, :cluster, :removed], %{count: 1},
                 %{node_id: acc.node_id, new_cluster: new_cluster})
               # Schedule self-stop after replying to pending calls
+              Process.send_after(self(), :shutdown_not_in_cluster, 100)
+            end
+            new_data
+
+          # Backward compatibility with older single-entry membership logs.
+          {_, _, {:config_change, new_cluster}} ->
+            :telemetry.execute([:raft_ex, :cluster, :config_change], %{count: 1},
+              %{node_id: acc.node_id, new_cluster: new_cluster})
+            new_data = %{acc | cluster: new_cluster, joint_config: nil}
+            if acc.node_id not in new_cluster do
               Process.send_after(self(), :shutdown_not_in_cluster, 100)
             end
             new_data
