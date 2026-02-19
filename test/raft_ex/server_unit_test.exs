@@ -8,6 +8,7 @@ defmodule RaftEx.ServerUnitTest do
   """
   use ExUnit.Case, async: false
   alias RaftEx.RPC.RequestVote
+  alias RaftEx.RPC.AppendEntries
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -421,6 +422,60 @@ defmodule RaftEx.ServerUnitTest do
       end
 
       stop_cluster(cluster)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # §7 — Snapshot boundary behavior
+  # ---------------------------------------------------------------------------
+
+  describe "§7 — snapshot boundary prevLog matching" do
+    test "follower accepts AppendEntries when prevLog matches snapshot boundary" do
+      node_id = :"snap_boundary_#{:erlang.unique_integer([:positive])}"
+      cluster = [node_id, :"#{node_id}_peer"]
+      tmp = System.tmp_dir!()
+
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_meta.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_log.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_snapshot.bin"))
+
+      snapshot = %{
+        last_included_index: 10,
+        last_included_term: 2,
+        cluster: cluster,
+        data: RaftEx.StateMachine.serialize(%{})
+      }
+
+      :ok =
+        File.write(
+          RaftEx.Snapshot.snapshot_path(node_id),
+          :erlang.term_to_binary(snapshot)
+        )
+
+      {:ok, _} = RaftEx.start_node(node_id, cluster)
+
+      rpc = %AppendEntries{
+        term: 2,
+        leader_id: :"#{node_id}_peer",
+        prev_log_index: 10,
+        prev_log_term: 2,
+        entries: [{11, 2, {:set, "snap_key", "snap_val"}}],
+        leader_commit: 11
+      }
+
+      :gen_statem.cast(:"raft_server_#{node_id}", rpc)
+      Process.sleep(120)
+
+      s = RaftEx.status(node_id)
+      assert s.commit_index == 11
+      assert s.last_applied == 11
+      assert s.sm_state["snap_key"] == "snap_val"
+
+      RaftEx.stop_node(node_id)
+      Process.sleep(50)
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_meta.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_log.dets"))
+      File.rm(Path.join(tmp, "raft_ex_#{node_id}_snapshot.bin"))
     end
   end
 end

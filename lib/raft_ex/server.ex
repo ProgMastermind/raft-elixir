@@ -528,8 +528,9 @@ defmodule RaftEx.Server do
         actions = [{:state_timeout, election_timeout(), :election_timeout}]
         {:next_state, next_state, data, actions}
 
-      # §5.3 Rule 2: reply false if log doesn't contain prevLogIndex/prevLogTerm
-      not Log.has_entry?(data.node_id, rpc.prev_log_index, rpc.prev_log_term) ->
+      # §5.3 Rule 2: reply false if we do not have a matching prev-log marker.
+      # When log is compacted, the marker may come from snapshot metadata (§7).
+      not prev_log_matches?(data.node_id, rpc.prev_log_index, rpc.prev_log_term) ->
         # Fast backtracking: send conflict info (§5.3 optimization)
         {conflict_index, conflict_term} = find_conflict(data.node_id, rpc.prev_log_index)
         reply = %AppendEntriesReply{
@@ -656,7 +657,7 @@ defmodule RaftEx.Server do
   defp send_append_entries_to(data, peer) do
     next_idx = Map.get(data.next_index, peer, 1)
     prev_log_index = next_idx - 1
-    prev_log_term  = Log.term_at(data.node_id, prev_log_index) || 0
+    prev_log_term  = prev_log_term(data.node_id, prev_log_index)
 
     # §7: if nextIndex <= snapshot's last_included_index, send InstallSnapshot
     snap = Snapshot.load(data.node_id)
@@ -814,9 +815,7 @@ defmodule RaftEx.Server do
           {_, _, {:config_change, new_cluster}} ->
             :telemetry.execute([:raft_ex, :cluster, :config_change], %{count: 1},
               %{node_id: acc.node_id, new_cluster: new_cluster})
-            new_data =
-              %{acc | cluster: new_cluster, joint_config: nil}
-              |> compact_replication_state()
+            new_data = %{acc | cluster: new_cluster, joint_config: nil}
             # §6: if this node is not in C_new, it must step down
             if acc.node_id not in new_cluster do
               :telemetry.execute([:raft_ex, :cluster, :removed], %{count: 1},
@@ -904,10 +903,42 @@ defmodule RaftEx.Server do
     if term > data.current_term, do: step_down(data, term), else: data
   end
 
+  defp prev_log_matches?(node_id, prev_log_index, prev_log_term) do
+    if Log.has_entry?(node_id, prev_log_index, prev_log_term) do
+      true
+    else
+      case Snapshot.load(node_id) do
+        %{last_included_index: ^prev_log_index, last_included_term: ^prev_log_term} -> true
+        _ -> false
+      end
+    end
+  end
+
+  defp prev_log_term(_node_id, 0), do: 0
+
+  defp prev_log_term(node_id, prev_log_index) do
+    case Log.term_at(node_id, prev_log_index) do
+      nil ->
+        case Snapshot.load(node_id) do
+          %{last_included_index: ^prev_log_index, last_included_term: term} -> term
+          _ -> 0
+        end
+
+      term ->
+        term
+    end
+  end
+
   defp replication_peers(data) do
     case data.joint_config do
       nil ->
-        Cluster.peers(data.cluster, data.node_id)
+        # Keep sending to known lagging peers even after transition so removed
+        # nodes can eventually receive the config_change entry and self-stop.
+        (Cluster.peers(data.cluster, data.node_id) ++
+           Map.keys(data.next_index) ++
+           Map.keys(data.match_index))
+        |> Enum.uniq()
+        |> Enum.reject(&(&1 == data.node_id))
 
       {old_cluster, new_cluster} ->
         Cluster.joint_peers(old_cluster, new_cluster, data.node_id)
@@ -927,22 +958,6 @@ defmodule RaftEx.Server do
       Enum.reduce(peers, data.match_index, fn peer, acc ->
         Map.put_new(acc, peer, 0)
       end)
-
-    %{data | next_index: next_index, match_index: match_index}
-  end
-
-  defp compact_replication_state(data) do
-    peers = MapSet.new(Cluster.peers(data.cluster, data.node_id))
-
-    next_index =
-      data.next_index
-      |> Enum.filter(fn {peer, _idx} -> MapSet.member?(peers, peer) end)
-      |> Map.new()
-
-    match_index =
-      data.match_index
-      |> Enum.filter(fn {peer, _idx} -> MapSet.member?(peers, peer) end)
-      |> Map.new()
 
     %{data | next_index: next_index, match_index: match_index}
   end
