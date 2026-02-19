@@ -7,6 +7,7 @@ defmodule RaftEx.ServerUnitTest do
   tests cover implicitly but not explicitly.
   """
   use ExUnit.Case, async: false
+  alias RaftEx.RPC.RequestVote
 
   # ---------------------------------------------------------------------------
   # Helpers
@@ -95,6 +96,33 @@ defmodule RaftEx.ServerUnitTest do
         # All nodes should be within 1 term of the leader
         assert s.current_term >= leader_term - 1
       end
+
+      stop_cluster(cluster)
+    end
+
+    test "leader steps down immediately on higher-term RequestVote" do
+      cluster = unique_cluster("higherterm_rv")
+      start_cluster(cluster)
+
+      leader = find_leader(cluster)
+      assert leader != nil
+      assert RaftEx.status(leader).role == :leader
+
+      higher_term = RaftEx.status(leader).current_term + 5
+
+      rpc = %RequestVote{
+        term: higher_term,
+        candidate_id: :"external_candidate_#{:erlang.unique_integer([:positive])}",
+        last_log_index: 0,
+        last_log_term: 0
+      }
+
+      :gen_statem.cast(:"raft_server_#{leader}", rpc)
+      Process.sleep(150)
+
+      s = RaftEx.status(leader)
+      assert s.current_term == higher_term
+      assert s.role == :follower
 
       stop_cluster(cluster)
     end

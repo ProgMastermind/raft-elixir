@@ -432,7 +432,8 @@ defmodule RaftEx.Server do
 
   defp handle_request_vote(%RequestVote{} = rpc, data, current_role) do
     # §5.1: if RPC term > currentTerm, update term and revert to follower
-    data = if rpc.term > data.current_term, do: step_down(data, rpc.term), else: data
+    higher_term_seen? = rpc.term > data.current_term
+    data = if higher_term_seen?, do: step_down(data, rpc.term), else: data
 
     grant? = can_grant_vote?(rpc, data)
 
@@ -467,7 +468,8 @@ defmodule RaftEx.Server do
       }
       RPC.send_reply(data.node_id, rpc.candidate_id, reply)
 
-      next_state = if rpc.term > data.current_term, do: :follower, else: current_role
+      # If we observed a higher term in this RPC, we must remain follower.
+      next_state = if higher_term_seen?, do: :follower, else: current_role
       actions = if next_state == :follower,
         do: [{:state_timeout, election_timeout(), :election_timeout}],
         else: []
