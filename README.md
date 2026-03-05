@@ -1,81 +1,46 @@
 # RaftEx
 
-A complete, spec-faithful implementation of the Raft consensus algorithm in Elixir.
+A from-scratch implementation of the [Raft consensus algorithm](https://raft.github.io/raft.pdf) in Elixir, built on OTP's `gen_statem`.
 
-> "In Search of an Understandable Consensus Algorithm"  
-> — Ongaro & Ousterhout (2014)
+Covers leader election, log replication, persistence, snapshots, joint consensus membership changes, and a TCP transport layer — about 1200 lines total. Each function in the codebase is annotated with the paper section it implements.
 
-Every rule from the paper is implemented and cited. Every invariant has a test.
+I wrote a detailed blog post about the design decisions and implementation: [I Built Raft Consensus From Scratch in Elixir. Here's What the Paper Doesn't Tell You.](https://hashnode.com/edit/cmmdvamtp00q01qj01fz7fgw8)
 
 ---
 
-## What's implemented
+## What's Implemented
 
-| Paper Section | Feature |
+| Paper Section | What it covers |
 |---|---|
-| §5.1 | Persistent state — `currentTerm`, `votedFor`, `log[]` written to DETS before any RPC |
-| §5.2 | Leader election — randomized timeout (150–300ms), PreVote + RequestVote, majority vote counting |
-| §5.3 | Log replication — AppendEntries with all 5 receiver rules, `nextIndex`/`matchIndex` |
-| §5.4.1 | Election restriction — log up-to-date check (term first, then length) |
-| §5.4.2 | Commit discipline — leader only advances `commitIndex` for current-term entries |
-| §5.5 | Fault tolerance — follower crash, leader crash, automatic re-election and catch-up |
-| §5.6 | Timing — 50ms heartbeat `<<` 150–300ms election timeout |
-| §6 | Joint consensus — `C_old,new` two-phase membership change, graceful node removal |
-| §7 | Log compaction — snapshot create/load, chunked `InstallSnapshot` transfer, log truncation |
-| §8 | Client interaction — redirect to leader, no-op on election, linearizable reads |
-| Transport | TCP networking — length-prefixed framed RPC transport with connection reuse |
+| §5.1 | `currentTerm`, `votedFor`, and log persisted to DETS before any RPC response |
+| §5.2 | Leader election with randomized timeouts (150–300ms), RequestVote RPC |
+| §5.3 | Log replication via AppendEntries, conflict detection, `nextIndex`/`matchIndex` tracking |
+| §5.4 | Election restriction (log up-to-date check) and commit safety (current-term-only rule) |
+| §5.6 | Heartbeat interval (50ms) ≪ election timeout, ensuring leader stability |
+| §6 | Two-phase membership changes via joint consensus (`C_old,new` → `C_new`) |
+| §7 | Snapshot creation, log compaction, chunked InstallSnapshot RPC |
+| §8 | Client redirect to leader, no-op on election win, linearizable reads |
+| Pre-vote | Pre-vote protocol to prevent term inflation from partitioned nodes |
+| Fast backtrack | Conflict-aware log backtracking to reduce catch-up round trips |
 
 ---
 
-## Project structure
-
-```
-raft_ex_v2/
-├── lib/raft_ex/
-│   ├── server.ex        # :gen_statem FSM — follower/candidate/leader roles
-│   ├── log.ex           # DETS-backed log storage
-│   ├── persistence.ex   # DETS-backed currentTerm + votedFor
-│   ├── rpc.ex           # Raft RPC structs + send facade
-│   ├── transport.ex     # Node endpoint resolution
-│   ├── tcp_transport.ex # Outbound framed TCP RPC sender
-│   ├── tcp_listener.ex  # Inbound TCP listener and decoder
-│   ├── tcp_connection_pool.ex # Reused outbound TCP socket pool
-│   ├── cluster.ex       # Peer list, majority/joint-majority helpers
-│   ├── state_machine.ex # KV store — set/get/delete
-│   ├── snapshot.ex      # Snapshot create/load/install
-│   ├── inspector.ex     # Telemetry handler — prints every event to stdout
-│   └── application.ex   # OTP supervision tree
-├── lib/raft_ex.ex        # Public API
-├── scripts/demo.exs      # Full interactive demo
-└── test/raft_ex/
-    ├── persistence_test.exs
-    ├── log_test.exs
-    ├── rpc_test.exs
-    ├── cluster_test.exs
-    ├── state_machine_test.exs
-    ├── snapshot_test.exs
-    ├── server_unit_test.exs
-    ├── fault_tolerance_test.exs
-    └── joint_consensus_test.exs
-```
-
----
-
-## Quick start
+## Quick Start
 
 ```bash
-cd raft_ex_v2
+git clone https://github.com/ProgMastermind/raft-elixir.git
+cd raft-elixir
 mix deps.get
 mix compile
 ```
 
-Run the full demo (shows every state transition, RPC, vote, commit, and apply):
+**Run the interactive demo** (shows elections, replication, commits, failover, and membership changes):
 
 ```bash
 mix run scripts/demo.exs
 ```
 
-Run all tests:
+**Run all tests:**
 
 ```bash
 mix test
@@ -83,56 +48,34 @@ mix test
 
 ---
 
-## Using the API
+## API
 
 ### Start a cluster
 
 ```elixir
 cluster = [:n1, :n2, :n3]
 
-# Start each node — all nodes need to know the full cluster
 {:ok, _} = RaftEx.start_node(:n1, cluster)
 {:ok, _} = RaftEx.start_node(:n2, cluster)
 {:ok, _} = RaftEx.start_node(:n3, cluster)
 
-# Wait for election (150–300ms)
+# Wait for election (~300ms)
 Process.sleep(500)
 ```
 
-You can also provide explicit TCP endpoints:
-
-```elixir
-cluster = [:n1, :n2, :n3]
-endpoints = %{
-  n1: {"127.0.0.1", 31_001},
-  n2: {"127.0.0.1", 31_002},
-  n3: {"127.0.0.1", 31_003}
-}
-
-{:ok, _} = RaftEx.start_node(:n1, cluster, endpoints: endpoints)
-{:ok, _} = RaftEx.start_node(:n2, cluster, endpoints: endpoints)
-{:ok, _} = RaftEx.start_node(:n3, cluster, endpoints: endpoints)
-```
-
-### Find the leader
+### Write and read
 
 ```elixir
 leader = RaftEx.find_leader(cluster)
-# => :n1  (whichever won the election)
-```
 
-### Write and read data
-
-```elixir
 {:ok, "alice"} = RaftEx.set(leader, "username", "alice")
 {:ok, "alice"} = RaftEx.get(leader, "username")
-{:ok, :ok}     = RaftEx.delete(leader, "username")
+:ok            = RaftEx.delete(leader, "username")
 ```
 
-### Send a command to any node (auto-redirects to leader)
+Commands sent to a follower are automatically redirected to the leader:
 
 ```elixir
-# Works even if you don't know who the leader is
 {:ok, result} = RaftEx.command(cluster, {:set, "key", "value"})
 ```
 
@@ -140,8 +83,7 @@ leader = RaftEx.find_leader(cluster)
 
 ```elixir
 RaftEx.status(:n1)
-# => %{
-#   node_id: :n1,
+# %{
 #   role: :follower,
 #   current_term: 3,
 #   commit_index: 7,
@@ -152,133 +94,134 @@ RaftEx.status(:n1)
 # }
 ```
 
+### Membership changes (§6)
+
+```elixir
+# Add a node
+{:ok, _} = RaftEx.start_node(:n4, [:n1, :n2, :n3, :n4])
+{:ok, _} = RaftEx.add_node(:n1, :n4, [:n1, :n2, :n3])
+
+# Remove a node (node shuts down after the config change commits)
+{:ok, _} = RaftEx.remove_node(:n1, :n4, [:n1, :n2, :n3, :n4])
+```
+
 ### Stop a node
 
 ```elixir
 RaftEx.stop_node(:n1)
 ```
 
-### Cluster membership change (§6)
-
-```elixir
-# Add a node — start it first, then submit config_change
-{:ok, _} = RaftEx.start_node(:n4, [:n1, :n2, :n3, :n4])
-{:ok, _} = RaftEx.Server.command(leader, {:config_change, [:n1, :n2, :n3, :n4]})
-
-# Remove a node — submit config_change, node shuts down after commit
-{:ok, _} = RaftEx.Server.command(leader, {:config_change, [:n1, :n2, :n3]})
-```
-
-### Create a snapshot (§7)
-
-```elixir
-s = RaftEx.status(leader)
-{:ok, snap} = RaftEx.Snapshot.create(
-  leader,
-  s.commit_index,
-  s.current_term,
-  cluster,
-  s.sm_state
-)
-# snap.last_included_index, snap.last_included_term, snap.data
-```
-
 ---
 
-## How it works
-
-### Roles
-
-Each node runs as a `:gen_statem` with three named state functions:
-
-- **`follower/3`** — default state; resets election timer on valid heartbeat or vote grant
-- **`pre_candidate/3`** — runs pre-vote probe to avoid unnecessary term bumps
-- **`candidate/3`** — increments term, votes for self, sends `RequestVote` to all peers
-- **`leader/3`** — sends heartbeats every 50ms, replicates log entries, advances `commitIndex`
-
-### Network transport
-
-Raft RPC traffic runs over TCP using binary framing:
+## Architecture
 
 ```
-<<payload_size::32-big, payload::binary>>
-payload = :erlang.term_to_binary(rpc_struct)
+RaftEx.Supervisor (one_for_one)
+├── TcpConnectionPool     — pooled outbound TCP connections, one per peer
+├── Inspector             — telemetry handler, logs all Raft events to stdout
+└── NodeSupervisor        — DynamicSupervisor
+    └── Server (per node) — gen_statem FSM (follower/candidate/leader)
+        └── TcpListener   — per-node inbound TCP acceptor
 ```
 
-Outbound sends use a shared connection pool for socket reuse. Inbound listeners
-decode framed messages and dispatch to the local Raft server FSM.
+### Modules
 
-### Persistence
+| Module | Purpose |
+|---|---|
+| `Server` | Core Raft FSM — election, replication, commit, state transitions |
+| `Log` | DETS-backed log with conflict-aware append and truncation |
+| `Persistence` | DETS-backed `currentTerm` and `votedFor` with sync-on-write |
+| `Cluster` | Quorum math, peer lists, joint majority checks |
+| `Snapshot` | Snapshot creation, log compaction, InstallSnapshot handling |
+| `StateMachine` | Replicated key-value store (set/get/delete) |
+| `RPC` | Message structs and dispatch (RequestVote, AppendEntries, InstallSnapshot, PreVote) |
+| `TcpTransport` | 4-byte length-prefixed binary framing over TCP |
+| `TcpConnectionPool` | Connection pooling with reconnect-on-failure |
+| `TcpListener` | Inbound TCP message loop, deserialize and dispatch to gen_statem |
+| `Transport` | Node ID → `{host, port}` endpoint resolution |
+| `Inspector` | Telemetry event handler — prints state transitions, RPCs, commits |
 
-Before responding to any RPC, the server writes to DETS:
+### How replication works
 
 ```
-{:raft_meta, node_id}  →  {:current_term, N}  and  {:voted_for, atom | nil}
-{:raft_log, node_id}   →  {index, term, command}  entries
-```
-
-On restart, these are loaded back before the FSM starts — `currentTerm` never goes backward.
-
-### Log replication flow
-
-```
-Client → leader.command/2
-  → Log.append (DETS)
-  → AppendEntries to all peers
-  → peers reply AppendEntriesReply{success: true, match_index: N}
-  → leader advances matchIndex[peer]
-  → maybe_advance_commit: if majority have matchIndex >= N and log[N].term == currentTerm
-  → apply_committed_entries: StateMachine.apply_entries
-  → reply to client
+Client → RaftEx.set(leader, key, value)
+       → Server.command/2
+       → Log.append to DETS
+       → AppendEntries RPC to all peers
+       → Followers append, reply with match_index
+       → Leader checks: majority replicated AND entry is from current term?
+         → Yes: advance commit_index, apply to StateMachine, reply to client
 ```
 
 ### Observability
 
-Every event emits a `:telemetry` event and is printed by `RaftEx.Inspector`:
+Every state transition, RPC, vote, and commit emits a `:telemetry` event. `Inspector` prints them:
 
 ```
-[NODE :n1] [LEADER] 📝 appended index=4 term=2 cmd={:set, "key", "val"}
+[NODE :n1] [LEADER] appended index=4 term=2 cmd={:set, "key", "val"}
 [NODE :n1] → SEND AppendEntries to n2
 [NODE :n2] ← REPLY AppendEntriesReply to n1
-[NODE :n1] ✔ COMMITTED up to index=4
-[NODE :n1] ⚙ APPLIED index=4 result={:ok, "val"}
+[NODE :n1] COMMITTED up to index=4
+[NODE :n1] APPLIED index=4 result={:ok, "val"}
 ```
 
 ---
 
 ## Tests
 
-```
-4 properties, 135 tests, 0 failures
-```
-
-| File | What it tests |
+| Test file | Coverage |
 |---|---|
-| `persistence_test.exs` | DETS read/write, crash recovery |
-| `log_test.exs` | Append, truncate, conflict detection, property tests |
-| `rpc_test.exs` | Struct construction and serialization |
-| `cluster_test.exs` | Majority, joint majority, peer list |
-| `state_machine_test.exs` | KV set/get/delete, apply_entries |
-| `snapshot_test.exs` | Create, load, install |
-| `server_unit_test.exs` | FSM logic — election, replication, commit |
-| `fault_tolerance_test.exs` | Leader crash, follower crash, network partition |
-| `joint_consensus_test.exs` | §6 node removal shutdown, joint majority voting |
-| `tcp_transport_test.exs` | TCP framing, partial frames, dropped connections, unreachable peers |
+| `persistence_test.exs` | DETS read/write, crash recovery, term monotonicity |
+| `log_test.exs` | Append, truncate, conflict detection, property-based tests |
+| `rpc_test.exs` | Struct construction and serialization round-trips |
+| `cluster_test.exs` | Majority math, joint majority, peer list generation |
+| `state_machine_test.exs` | KV set/get/delete, batch apply |
+| `snapshot_test.exs` | Create, load, install, log truncation after snapshot |
+| `server_unit_test.exs` | FSM transitions — election, replication, commit advancement |
+| `fault_tolerance_test.exs` | Leader crash recovery, follower crash recovery, re-election |
+| `joint_consensus_test.exs` | Node add/remove, joint majority voting, leader self-removal |
+| `tcp_transport_test.exs` | TCP framing, connection behavior, reconnection |
+
+```bash
+mix test                    # run all tests
+mix test test/raft_ex/server_unit_test.exs   # run a specific file
+```
 
 ---
 
-## Timing constants
+## Configuration
 
-| Constant | Value | Paper ref |
+Timing constants (in `lib/raft_ex/server.ex`):
+
+| Constant | Value | Raft paper reference |
 |---|---|---|
-| Election timeout | 150–300ms (random) | §5.2 |
+| Election timeout | 150–300ms (randomized) | §5.2 |
 | Heartbeat interval | 50ms | §5.2 |
-| RPC call timeout | 5000ms | §8 |
+| Snapshot threshold | 100 log entries | §7 |
+| Snapshot chunk size | 64 KB | §7 |
+
+TCP endpoints are auto-assigned on `localhost`. To override:
+
+```elixir
+RaftEx.start_node(:n1, [:n1, :n2, :n3],
+  endpoints: %{
+    n1: {"127.0.0.1", 4001},
+    n2: {"127.0.0.1", 4002},
+    n3: {"127.0.0.1", 4003}
+  }
+)
+```
 
 ---
 
-## Reference
+## Requirements
 
-- Paper: https://raft.github.io/raft.pdf  
-- Visualization: https://raft.github.io  
-- Elixir docs: https://elixir-lang.org/docs.html
+- Elixir >= 1.18
+- Erlang/OTP >= 27
+
+---
+
+## References
+
+- [In Search of an Understandable Consensus Algorithm (Ongaro & Ousterhout, 2014)](https://raft.github.io/raft.pdf)
+- [Raft Visualization](https://raft.github.io)
